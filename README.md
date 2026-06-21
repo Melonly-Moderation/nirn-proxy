@@ -1,7 +1,9 @@
 # Archival notice
-Thanks for all the support. This project was born out of a need within Dyno, and I'm glad it ended up being useful to many other bot creators as well.
+~~Thanks for all the support. This project was born out of a need within Dyno, and I'm glad it ended up being useful to many other bot creators as well.
 
-Unfortunately, I no longer have the time or capacity to maintain it. I’ve since stepped away from Discord bot development and I’m no longer active enough in the ecosystem to keep up with ongoing changes. Because of that, I’ve decided to archive this project.
+Unfortunately, I no longer have the time or capacity to maintain it. I’ve since stepped away from Discord bot development and I’m no longer active enough in the ecosystem to keep up with ongoing changes. Because of that, I’ve decided to archive this project.~~
+
+The Melonly team has decided to pick up this project to maintain it.
 
 # Nirn-proxy
 Nirn-proxy is a highly available, transparent & dynamic HTTP proxy that 
