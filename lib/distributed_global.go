@@ -6,6 +6,7 @@ import (
 	"github.com/Clever/leakybucket"
 	"github.com/Clever/leakybucket/memory"
 	"github.com/sirupsen/logrus"
+	"io"
 	"net/http"
 	"strconv"
 	"sync"
@@ -15,23 +16,23 @@ import (
 type ClusterGlobalRateLimiter struct {
 	sync.RWMutex
 	globalBucketsMap map[uint64]*leakybucket.Bucket
-	memStorage *memory.Storage
+	memStorage       *memory.Storage
 }
 
 func NewClusterGlobalRateLimiter() *ClusterGlobalRateLimiter {
 	memStorage := memory.New()
 	return &ClusterGlobalRateLimiter{
-		memStorage: memStorage,
+		memStorage:       memStorage,
 		globalBucketsMap: make(map[uint64]*leakybucket.Bucket),
 	}
 }
 
 func (c *ClusterGlobalRateLimiter) Take(botHash uint64, botLimit uint) {
-	bucket := *c.getOrCreate(botHash, botLimit)
+	bucket := c.getOrCreate(botHash, botLimit)
 takeGlobal:
-	_, err := bucket.Add(1)
+	_, err := (*bucket).Add(1)
 	if err != nil {
-		reset := bucket.Reset()
+		reset := (*bucket).Reset()
 		logger.WithFields(logrus.Fields{
 			"waitTime": time.Until(reset),
 		}).Trace("Failed to grab global token, sleeping for a bit")
@@ -53,18 +54,16 @@ func (c *ClusterGlobalRateLimiter) getOrCreate(botHash uint64, botLimit uint) *l
 			return b
 		}
 
-		globalBucket, _ := c.memStorage.Create(strconv.FormatUint(botHash, 10), botLimit, 1 * time.Second)
+		globalBucket, _ := c.memStorage.Create(strconv.FormatUint(botHash, 10), botLimit, 1*time.Second)
 		c.globalBucketsMap[botHash] = &globalBucket
 		c.Unlock()
 		return &globalBucket
-	} else {
-		return b
 	}
+	return b
 }
 
-
 func (c *ClusterGlobalRateLimiter) FireGlobalRequest(ctx context.Context, addr string, botHash uint64, botLimit uint) error {
-	globalReq, err := http.NewRequestWithContext(ctx, "GET", "http://" + addr + "/nirn/global", nil)
+	globalReq, err := http.NewRequestWithContext(ctx, "GET", "http://"+addr+"/nirn/global", nil)
 	if err != nil {
 		return err
 	}
@@ -79,6 +78,8 @@ func (c *ClusterGlobalRateLimiter) FireGlobalRequest(ctx context.Context, addr s
 	if err != nil {
 		return err
 	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode != 200 {
 		return errors.New("global request failed with status " + resp.Status)

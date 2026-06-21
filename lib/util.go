@@ -11,9 +11,7 @@ import (
 var table = crc64.MakeTable(crc64.ISO)
 
 func HashCRC64(data string) uint64 {
-	h := crc64.New(table)
-	h.Write([]byte(data))
-	return h.Sum64()
+	return crc64.Checksum([]byte(data), table)
 }
 
 const EpochDiscord = 1420070400000

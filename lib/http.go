@@ -1,7 +1,7 @@
 package lib
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 	"strings"
 )
@@ -20,19 +20,11 @@ func copyHeader(dst, src http.Header) {
 
 func CopyResponseToResponseWriter(resp *http.Response, respWriter *http.ResponseWriter) error {
 	writer := *respWriter
-	body, err := ioutil.ReadAll(resp.Body)
-	if err != nil {
-		writer.WriteHeader(500)
-		_, _ = writer.Write([]byte(err.Error()))
-		return err
-	}
+	defer resp.Body.Close()
 
 	copyHeader(writer.Header(), resp.Header)
 	writer.WriteHeader(resp.StatusCode)
 
-	_, err = writer.Write(body)
-	if err != nil {
-		return err
-	}
-	return nil
+	_, err := io.Copy(writer, resp.Body)
+	return err
 }

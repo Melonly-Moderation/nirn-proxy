@@ -7,7 +7,6 @@ import (
 	"errors"
 	"github.com/sirupsen/logrus"
 	"io"
-	"io/ioutil"
 	"math"
 	"net"
 	"net/http"
@@ -23,6 +22,10 @@ var contextTimeout time.Duration
 var globalOverrideMap = make(map[string]uint)
 
 var disableRestLimitDetection = false
+
+type contextKey string
+
+const metricsPathContextKey contextKey = "metricsPath"
 
 type BotGatewayResponse struct {
 	SessionStartLimit map[string]int `json:"session_start_limit"`
@@ -46,6 +49,7 @@ func createTransport(ip string, disableHttp2 bool) http.RoundTripper {
 			}).DialContext,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          1000,
+			MaxIdleConnsPerHost:   256,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 1 * time.Second,
@@ -71,6 +75,7 @@ func createTransport(ip string, disableHttp2 bool) http.RoundTripper {
 		transport = http.Transport{
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          1000,
+			MaxIdleConnsPerHost:   256,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
 			ExpectContinueTimeout: 2 * time.Second,
@@ -154,6 +159,7 @@ func GetBotGlobalLimit(token string, user *BotUserResponse) (uint, error) {
 	if err != nil {
 		return 0, err
 	}
+	defer bot.Body.Close()
 
 	switch {
 	case bot.StatusCode == 401:
@@ -165,7 +171,7 @@ func GetBotGlobalLimit(token string, user *BotUserResponse) (uint, error) {
 		return 0, errors.New("500 on gateway/bot")
 	}
 
-	body, _ := ioutil.ReadAll(bot.Body)
+	body, _ := io.ReadAll(bot.Body)
 
 	var s BotGatewayResponse
 
@@ -196,6 +202,7 @@ func GetBotUser(token string) (*BotUserResponse, error) {
 	if err != nil {
 		return nil, err
 	}
+	defer bot.Body.Close()
 
 	switch {
 	case bot.StatusCode == 429:
@@ -204,7 +211,7 @@ func GetBotUser(token string) (*BotUserResponse, error) {
 		return nil, errors.New("500 on users/@me")
 	}
 
-	body, _ := ioutil.ReadAll(bot.Body)
+	body, _ := io.ReadAll(bot.Body)
 
 	var s BotUserResponse
 
@@ -233,7 +240,10 @@ func doDiscordReq(ctx context.Context, path string, method string, body io.ReadC
 	}
 
 	if err == nil {
-		route := GetMetricsPath(path)
+		route, _ := ctx.Value(metricsPathContextKey).(string)
+		if route == "" {
+			route = GetMetricsPath(path)
+		}
 		status := discordResp.Status
 		method := discordResp.Request.Method
 		elapsed := time.Since(startTime).Seconds()
@@ -244,7 +254,7 @@ func doDiscordReq(ctx context.Context, path string, method string, body io.ReadC
 			}
 		}
 
-		RequestHistogram.With(map[string]string{"route": route, "status": status, "method": method, "clientId": identifier.(string)}).Observe(elapsed)
+		RequestHistogram.WithLabelValues(method, status, route, identifier.(string)).Observe(elapsed)
 	}
 	return discordResp, err
 }
@@ -255,6 +265,8 @@ func ProcessRequest(ctx context.Context, item *QueueItem) (*http.Response, error
 
 	ctx, cancel := context.WithTimeout(ctx, contextTimeout)
 	defer cancel()
+	bucketPath := GetOptimisticBucketPath(req.URL.Path, req.Method)
+	ctx = context.WithValue(ctx, metricsPathContextKey, MetricsPathFromBucket(bucketPath))
 	discordResp, err := doDiscordReq(ctx, req.URL.Path, req.Method, req.Body, req.Header.Clone(), req.URL.RawQuery)
 
 	if err != nil {

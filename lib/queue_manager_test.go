@@ -12,12 +12,13 @@ func TestGetRequestRoutingInfoBasicAuth(t *testing.T) {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	hash, path, queueType := manager.GetRequestRoutingInfo(req, "Basic ZmFrZVRva2Vu")
+	bucketPath := GetOptimisticBucketPath(req.URL.Path, req.Method)
+	hash, queueType := manager.GetRequestRoutingInfo(bucketPath, "Basic ZmFrZVRva2Vu")
 	if queueType != NoAuth {
 		t.Fatalf("expected queue type %v, got %v", NoAuth, queueType)
 	}
 
-	if hash != HashCRC64(path) {
+	if hash != HashCRC64(bucketPath) {
 		t.Fatalf("expected routing hash to match path hash")
 	}
 }
@@ -29,7 +30,8 @@ func TestGetRequestRoutingInfoBearerAuth(t *testing.T) {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	hash, _, queueType := manager.GetRequestRoutingInfo(req, "Bearer some-token")
+	bucketPath := GetOptimisticBucketPath(req.URL.Path, req.Method)
+	hash, queueType := manager.GetRequestRoutingInfo(bucketPath, "Bearer some-token")
 	if queueType != Bearer {
 		t.Fatalf("expected queue type %v, got %v", Bearer, queueType)
 	}
@@ -46,12 +48,13 @@ func TestGetRequestRoutingInfoBotToken(t *testing.T) {
 		t.Fatalf("failed to create request: %v", err)
 	}
 
-	hash, path, queueType := manager.GetRequestRoutingInfo(req, "Bot Abc")
+	bucketPath := GetOptimisticBucketPath(req.URL.Path, req.Method)
+	hash, queueType := manager.GetRequestRoutingInfo(bucketPath, "Bot Abc")
 	if queueType != Bot {
 		t.Fatalf("expected queue type %v, got %v", Bot, queueType)
 	}
 
-	if hash != HashCRC64(path) {
+	if hash != HashCRC64(bucketPath) {
 		t.Fatalf("expected bot routing hash to match path hash")
 	}
 }

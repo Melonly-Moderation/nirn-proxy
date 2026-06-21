@@ -39,29 +39,35 @@ func IsNumericInput(str string) bool {
 }
 
 func GetMetricsPath(route string) string {
-	route = GetOptimisticBucketPath(route, "")
-	var path = ""
-	parts := strings.Split(route, "/")
+	return MetricsPathFromBucket(GetOptimisticBucketPath(route, ""))
+}
 
+func MetricsPathFromBucket(route string) string {
 	if strings.HasPrefix(route, "/invite/!") {
 		return "/invite/!"
 	}
 
+	var path strings.Builder
+	parts := strings.Split(route, "/")
 	for _, part := range parts {
-		if part == "" { continue }
+		if part == "" {
+			continue
+		}
 		if IsNumericInput(part) {
-			path += "/!"
+			path.WriteString("/!")
 		} else {
-			path += "/" + part
+			path.WriteByte('/')
+			path.WriteString(part)
 		}
 	}
 
-	if !utf8.ValidString(path) {
-		logger.Warn("Non utf-8 path detected, Prometheus only supports utf-8, invalid runes will be replaced with @ in metrics. Path: " + path)
-		path = strings.ToValidUTF8(path, "@")
+	result := path.String()
+	if !utf8.ValidString(result) {
+		logger.Warn("Non utf-8 path detected, Prometheus only supports utf-8, invalid runes will be replaced with @ in metrics. Path: " + result)
+		result = strings.ToValidUTF8(result, "@")
 	}
 
-	return path
+	return result
 }
 
 func GetOptimisticBucketPath(url string, method string) string {
@@ -133,7 +139,7 @@ func GetOptimisticBucketPath(url string, method string) string {
 	for idx, part := range parts[2:] {
 		if IsSnowflake(part) {
 			// Custom rule for messages older than 14d
-			if currMajor == MajorChannels && parts[idx - 1] == "messages" && method == "DELETE" {
+			if currMajor == MajorChannels && parts[1+idx] == "messages" && method == "DELETE" {
 				createdAt, _ := GetSnowflakeCreatedAt(part)
 				if createdAt.Before(time.Now().Add(-1 * 14 * 24 * time.Hour)) {
 					bucket.WriteString("/!14dmsg")

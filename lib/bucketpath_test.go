@@ -2,10 +2,20 @@ package lib
 
 import (
 	"fmt"
+	"strconv"
 	"testing"
+	"time"
 )
 
+func snowflakeFromTime(t time.Time) string {
+	ms := t.UnixMilli() - EpochDiscord
+	return strconv.FormatUint(uint64(ms)<<22, 10)
+}
+
 func TestPaths(t *testing.T) {
+	oldMessageID := snowflakeFromTime(time.Now().Add(-15 * 24 * time.Hour))
+	recentMessageID := snowflakeFromTime(time.Now().Add(-5 * time.Second))
+
 	var tests = []struct {
 		path, method, want string
 	}{
@@ -20,6 +30,8 @@ func TestPaths(t *testing.T) {
 		{"/api/v9/channels/872712139712913438/messages/872712150509047809/reactions/PandaOhShit:863985751205085195", "DELETE", "/channels/872712139712913438/messages/!/reactions/!modify"},
 		{"/api/v9/channels/872712139712913438/messages/872712150509047809/reactions/PandaOhShit:863985751205085195/@me", "DELETE", "/channels/872712139712913438/messages/!/reactions/!modify"},
 		{"/api/v9/channels/872712139712913438/messages/872712150509047809/reactions/PandaOhShit:863985751205085195/203039963636301824", "DELETE", "/channels/872712139712913438/messages/!/reactions/!modify"},
+		{"/api/v9/channels/872712139712913438/messages/" + oldMessageID, "DELETE", "/channels/872712139712913438/messages/!14dmsg"},
+		{"/api/v9/channels/872712139712913438/messages/" + recentMessageID, "DELETE", "/channels/872712139712913438/messages/!10smsg"},
 		// Hooks major
 		{"/api/v9/webhooks/203039963636301824", "GET", "/webhooks/203039963636301824"},
 		{"/api/v9/webhooks/203039963636301824/VSOzAqY1OZFF5WJVtbIzFtmjGupk-84Hn0A_ZzToF_CHsPIeCk0Q9Uok_mjxR0dNtApI", "POST", "/webhooks/203039963636301824/!"},

@@ -3,8 +3,6 @@ package lib
 import (
 	"context"
 	"errors"
-	"github.com/Clever/leakybucket"
-	"github.com/Clever/leakybucket/memory"
 	"github.com/sirupsen/logrus"
 	"net/http"
 	"strconv"
@@ -13,6 +11,8 @@ import (
 	"sync/atomic"
 	"time"
 )
+
+var disable401Lock = EnvGetBool("DISABLE_401_LOCK", false)
 
 type QueueItem struct {
 	Req      *http.Request
@@ -28,12 +28,9 @@ type QueueChannel struct {
 
 type RequestQueue struct {
 	sync.RWMutex
-	globalLockedUntil *int64
 	// bucket path hash as key
-	queues       map[uint64]*QueueChannel
-	processor    func(ctx context.Context, item *QueueItem) (*http.Response, error)
-	globalBucket leakybucket.Bucket
-	// bufferSize Defines the size of the request channel buffer for each bucket
+	queues         map[uint64]*QueueChannel
+	processor      func(ctx context.Context, item *QueueItem) (*http.Response, error)
 	bufferSize     int
 	user           *BotUserResponse
 	identifier     string
@@ -57,23 +54,19 @@ func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http
 	}
 
 	limit, err := GetBotGlobalLimit(token, user)
-	memStorage := memory.New()
-	globalBucket, _ := memStorage.Create("global", limit, 1*time.Second)
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "invalid token") {
 			// Return a queue that will only return 401s
 			var invalid = new(int64)
 			*invalid = 999
 			return &RequestQueue{
-				queues:            make(map[uint64]*QueueChannel),
-				processor:         processor,
-				globalBucket:      globalBucket,
-				globalLockedUntil: new(int64),
-				bufferSize:        bufferSize,
-				user:              nil,
-				identifier:        "InvalidTokenQueue",
-				isTokenInvalid:    invalid,
-				botLimit:          limit,
+				queues:         make(map[uint64]*QueueChannel),
+				processor:      processor,
+				bufferSize:     bufferSize,
+				user:           nil,
+				identifier:     "InvalidTokenQueue",
+				isTokenInvalid: invalid,
+				botLimit:       limit,
 			}, nil
 		}
 
@@ -91,16 +84,14 @@ func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http
 	}
 
 	ret := &RequestQueue{
-		queues:            make(map[uint64]*QueueChannel),
-		processor:         processor,
-		globalBucket:      globalBucket,
-		globalLockedUntil: new(int64),
-		bufferSize:        bufferSize,
-		user:              user,
-		identifier:        identifier,
-		isTokenInvalid:    new(int64),
-		botLimit:          limit,
-		queueType:         queueType,
+		queues:         make(map[uint64]*QueueChannel),
+		processor:      processor,
+		bufferSize:     bufferSize,
+		user:           user,
+		identifier:     identifier,
+		isTokenInvalid: new(int64),
+		botLimit:       limit,
+		queueType:      queueType,
 	}
 
 	if queueType != Bearer {
@@ -181,20 +172,30 @@ func (q *RequestQueue) Queue(req *http.Request, res *http.ResponseWriter, path s
 
 func (q *RequestQueue) getQueueChannel(path string, pathHash uint64) *QueueChannel {
 	t := time.Now()
+	q.RLock()
+	ch, ok := q.queues[pathHash]
+	if ok {
+		ch.lastUsed = t
+		q.RUnlock()
+		return ch
+	}
+	q.RUnlock()
+
 	q.Lock()
 	defer q.Unlock()
-	ch, ok := q.queues[pathHash]
-	if !ok {
-		ch = &QueueChannel{
-			ch:       make(chan *QueueItem, q.bufferSize),
-			lastUsed: t,
-		}
-		q.queues[pathHash] = ch
-		// It's important that we only have 1 goroutine per channel
-		go q.subscribe(ch, path, pathHash)
-	} else {
+	ch, ok = q.queues[pathHash]
+	if ok {
 		ch.lastUsed = t
+		return ch
 	}
+
+	ch = &QueueChannel{
+		ch:       make(chan *QueueItem, q.bufferSize),
+		lastUsed: t,
+	}
+	q.queues[pathHash] = ch
+	// It's important that we only have 1 goroutine per channel
+	go q.subscribe(ch, path, pathHash)
 	return ch
 }
 
@@ -315,17 +316,6 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 
 		_, remaining, resetAfter, isGlobal, err := parseHeaders(&resp.Header, scope != "user")
 
-		if isGlobal {
-			//Lock global
-			sw := atomic.CompareAndSwapInt64(q.globalLockedUntil, 0, time.Now().Add(resetAfter).UnixNano())
-			if sw {
-				logger.WithFields(logrus.Fields{
-					"until":      time.Now().Add(resetAfter),
-					"resetAfter": resetAfter,
-				}).Warn("Global reached, locking")
-			}
-		}
-
 		if err != nil {
 			item.errChan <- err
 			continue
@@ -368,7 +358,7 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 				"status":     resp.StatusCode,
 			}).Error("Received 401 during normal operation, assuming token is invalidated, locking bucket permanently")
 
-			if EnvGet("DISABLE_401_LOCK", "false") != "true" {
+			if !disable401Lock {
 				atomic.StoreInt64(q.isTokenInvalid, 999)
 			}
 		}
@@ -380,8 +370,7 @@ func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64)
 		}
 
 		if remaining == 0 || resp.StatusCode == 429 {
-			duration := time.Until(time.Now().Add(resetAfter))
-			time.Sleep(duration)
+			time.Sleep(resetAfter)
 		}
 		prevRem, prevReset = remaining, resetAfter
 	}

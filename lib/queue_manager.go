@@ -80,8 +80,6 @@ func (m *QueueManager) reindexMembers() {
 
 	m.Lock()
 	defer m.Unlock()
-	m.bearerMu.Lock()
-	defer m.bearerMu.Unlock()
 
 	members := m.cluster.Members()
 	var orderedMembers []string
@@ -136,8 +134,6 @@ func (m *QueueManager) calculateRoute(pathHash uint64) string {
 
 	m.RLock()
 	defer m.RUnlock()
-	m.bearerMu.RLock()
-	defer m.bearerMu.RUnlock()
 
 	members := m.orderedClusterMembers
 	count := uint64(len(members))
@@ -248,20 +244,20 @@ func (m *QueueManager) getOrCreateBearerQueue(token string) (*RequestQueue, erro
 
 func (m *QueueManager) DiscordRequestHandler(resp http.ResponseWriter, req *http.Request) {
 	reqStart := time.Now()
-	metricsPath := GetMetricsPath(req.URL.Path)
-	ConnectionsOpen.With(map[string]string{"route": metricsPath, "method": req.Method}).Inc()
-	defer ConnectionsOpen.With(map[string]string{"route": metricsPath, "method": req.Method}).Dec()
+	bucketPath := GetOptimisticBucketPath(req.URL.Path, req.Method)
+	metricsPath := MetricsPathFromBucket(bucketPath)
+	ConnectionsOpen.WithLabelValues(req.Method, metricsPath).Inc()
+	defer ConnectionsOpen.WithLabelValues(req.Method, metricsPath).Dec()
 
 	token := req.Header.Get("Authorization")
-	routingHash, path, queueType := m.GetRequestRoutingInfo(req, token)
+	routingHash, queueType := m.GetRequestRoutingInfo(bucketPath, token)
 
-	m.fulfillRequest(&resp, req, queueType, path, routingHash, token, reqStart)
+	m.fulfillRequest(&resp, req, queueType, bucketPath, routingHash, token, reqStart)
 }
 
-func (m *QueueManager) GetRequestRoutingInfo(req *http.Request, token string) (routingHash uint64, path string, queueType QueueType) {
-	path = GetOptimisticBucketPath(req.URL.Path, req.Method)
+func (m *QueueManager) GetRequestRoutingInfo(bucketPath string, token string) (routingHash uint64, queueType QueueType) {
 	queueType = NoAuth
-	routingHash = HashCRC64(path)
+	routingHash = HashCRC64(bucketPath)
 
 	switch {
 	case HasAuthPrefix(token, "Bearer"):
