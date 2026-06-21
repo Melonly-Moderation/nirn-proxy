@@ -138,8 +138,8 @@ func GetOptimisticBucketPath(url string, method string) string {
 	// In this loop, we only need to strip all remaining snowflakes, emoji names and webhook tokens(optional)
 	for idx, part := range parts[2:] {
 		if IsSnowflake(part) {
-			// Custom rule for messages older than 14d
-			if currMajor == MajorChannels && parts[1+idx] == "messages" && method == "DELETE" {
+			// Custom rule for direct message DELETE only (not reactions etc.)
+			if currMajor == MajorChannels && parts[1+idx] == "messages" && method == "DELETE" && idx == len(parts[2:])-1 {
 				createdAt, _ := GetSnowflakeCreatedAt(part)
 				if createdAt.Before(time.Now().Add(-1 * 14 * 24 * time.Hour)) {
 					bucket.WriteString("/!14dmsg")

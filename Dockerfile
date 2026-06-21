@@ -1,4 +1,4 @@
-FROM golang:alpine as app-builder
+FROM golang:1.26-alpine AS app-builder
 WORKDIR /go/src/app
 COPY . .
 RUN CGO_ENABLED=0 go install -ldflags '-extldflags "-static"' -tags timetzdata -buildvcs=false
