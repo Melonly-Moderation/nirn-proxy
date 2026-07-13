@@ -22,7 +22,8 @@ func TestPaths(t *testing.T) {
 		// Guild Major
 		{"/api/v9/guilds/103039963636301824", "GET", "/guilds/103039963636301824"},
 		// Channel major
-		{"/api/v8/channels/203039963636301824", "GET", "/channels/!"},
+		{"/api/v8/channels/203039963636301824", "GET", "/channels/203039963636301824"},
+		{"/api/v8/channels/872712139712913438", "PATCH", "/channels/872712139712913438"},
 		{"/api/v7/channels/203039963636301824/pins", "GET", "/channels/203039963636301824/pins"},
 		{"/api/v6/channels/872712139712913438/messages/872712150509047809/reactions/%F0%9F%98%8B", "GET", "/channels/872712139712913438/messages/!/reactions/!/!"},
 		{"/api/v10/channels/872712139712913438/messages/872712150509047809/reactions/PandaOhShit:863985751205085195", "GET", "/channels/872712139712913438/messages/!/reactions/!/!"},
@@ -44,8 +45,7 @@ func TestPaths(t *testing.T) {
 		// No known major
 		{"/api/v9/invalid/203039963636301824", "GET", "/invalid/203039963636301824"},
 		{"/api/v9/invalid/203039963636301824/route/203039963636301824", "GET", "/invalid/203039963636301824/route/!"},
-		//Special case for /guilds/:id/channels
-		{"/api/v9/guilds/203039963636301824/channels", "GET", "/guilds/!/channels"},
+		{"/api/v9/guilds/203039963636301824/channels", "GET", "/guilds/203039963636301824/channels"},
 		// Wierd routes
 		{"/api/v9/guilds/templates/203039963636301824", "GET", "/guilds/templates/!"},
 		// Unversioned routes
