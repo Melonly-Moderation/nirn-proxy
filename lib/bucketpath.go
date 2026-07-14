@@ -8,11 +8,11 @@ import (
 )
 
 const (
-	MajorUnknown = "unk"
-	MajorChannels = "channels"
-	MajorGuilds = "guilds"
-	MajorWebhooks = "webhooks"
-	MajorInvites = "invites"
+	MajorUnknown      = "unk"
+	MajorChannels     = "channels"
+	MajorGuilds       = "guilds"
+	MajorWebhooks     = "webhooks"
+	MajorInvites      = "invites"
 	MajorInteractions = "interactions"
 )
 
@@ -73,15 +73,17 @@ func MetricsPathFromBucket(route string) string {
 func GetOptimisticBucketPath(url string, method string) string {
 	bucket := strings.Builder{}
 	bucket.WriteByte('/')
-	cleanUrl := strings.SplitN(url, "?", 1)[0]
-	if strings.HasPrefix(cleanUrl, "/api/v") {
-		cleanUrl = strings.ReplaceAll(cleanUrl, "/api/v", "")
-		l := len(cleanUrl)
-		i := strings.Index(cleanUrl, "/")
-		cleanUrl = cleanUrl[i+1:l]
+	cleanUrl := strings.SplitN(url, "?", 2)[0]
+	if versioned := strings.TrimPrefix(cleanUrl, "/api/v"); versioned != cleanUrl {
+		if slash := strings.IndexByte(versioned, '/'); slash >= 0 && IsNumericInput(versioned[:slash]) {
+			cleanUrl = versioned[slash+1:]
+		} else {
+			cleanUrl = strings.TrimPrefix(cleanUrl, "/api/")
+		}
+	} else if unversioned := strings.TrimPrefix(cleanUrl, "/api/"); unversioned != cleanUrl {
+		cleanUrl = unversioned
 	} else {
-		// Handle unversioned endpoints
-		cleanUrl = strings.ReplaceAll(cleanUrl, "/api/", "")
+		cleanUrl = strings.TrimPrefix(cleanUrl, "/")
 	}
 
 	parts := strings.Split(cleanUrl, "/")
@@ -171,18 +173,15 @@ func GetOptimisticBucketPath(url string, method string) string {
 				if err != nil {
 					interactionId = "Unknown"
 				} else {
-					interactionId = strings.Split(string(decodedPart), ":")[1]
+					_, interactionId, _ = strings.Cut(string(decodedPart), ":")
+					interactionId, _, _ = strings.Cut(interactionId, ":")
+					if interactionId == "" {
+						interactionId = "Unknown"
+					}
 				}
-			
+
 				bucket.WriteByte('/')
 				bucket.WriteString(interactionId)
-				continue
-			}
-
-
-			// Strip webhook tokens and interaction tokens
-			if (currMajor == MajorWebhooks || currMajor == MajorInteractions) && len(part) >= 64 {
-				bucket.WriteString("/!")
 				continue
 			}
 			bucket.WriteByte('/')

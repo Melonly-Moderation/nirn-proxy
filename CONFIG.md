@@ -17,8 +17,7 @@ Toggle to enable and register metrics. Disabling may improve resource usage
 Enables the performance profiling handler. Read more [here](https://github.com/google/pprof/blob/master/doc/README.md)
 
 ##### BUFFER_SIZE
-Size for the internal proxy go channels. Channels are used to synchronize and order requests. As each request comes in, it gets pushed to a channel. In go, channels can be buffered, this var defines the size of this buffer.
-Decreasing this will improve memory usage, but beware that once a channel buffer is full, requests will fight to be added to the channel on the next free spot. This means that during high usage periods, a part of the requests will be unordered if this value is set too low.
+Deprecated. The variable remains accepted for deployment compatibility, but the current scheduler has no request channel buffer and ignores this value.
 
 ##### OUTBOUND_IP
 The local address to use when firing requests to discord.

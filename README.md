@@ -33,7 +33,7 @@ Configuration options are
 | METRICS_PORT    | number                                      | 9000    |
 | ENABLE_METRICS  | boolean                                     | true    |
 | ENABLE_PPROF    | boolean                                     | false   |
-| BUFFER_SIZE     | number                                      | 50      |
+| BUFFER_SIZE     | deprecated (accepted, ignored)              | 50      |
 | OUTBOUND_IP     | string                                      | ""      |
 | BIND_IP         | string                                      | 0.0.0.0 |
 | REQUEST_TIMEOUT | number (milliseconds)                       | 5000    |

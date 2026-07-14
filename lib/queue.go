@@ -1,9 +1,11 @@
 package lib
 
 import (
+	"bytes"
 	"context"
-	"errors"
-	"github.com/sirupsen/logrus"
+	"fmt"
+	"io"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -12,41 +14,139 @@ import (
 	"time"
 )
 
+const bucketIdleTimeout = 10 * time.Minute
+
 var disable401Lock = EnvGetBool("DISABLE_401_LOCK", false)
 
-type QueueItem struct {
-	Req      *http.Request
-	Res      *http.ResponseWriter
-	doneChan chan *http.Response
-	errChan  chan error
+type bucketState struct {
+	gate fifoGate
+
+	active   atomic.Int64
+	lastUsed atomic.Int64
+
+	readyAt time.Time
+	fail404 bool
 }
 
-type QueueChannel struct {
-	ch       chan *QueueItem
-	lastUsed time.Time
+func newBucketState() *bucketState {
+	b := &bucketState{}
+	b.lastUsed.Store(time.Now().UnixNano())
+	return b
 }
 
-type RequestQueue struct {
-	sync.RWMutex
-	// bucket path hash as key
-	queues         map[uint64]*QueueChannel
-	processor      func(ctx context.Context, item *QueueItem) (*http.Response, error)
-	bufferSize     int
-	user           *BotUserResponse
-	identifier     string
-	isTokenInvalid *int64
-	botLimit       uint
-	queueType      QueueType
+type gateWaiter struct {
+	ready    chan struct{}
+	granted  bool
+	canceled bool
 }
 
-func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http.Response, error), token string, bufferSize int) (*RequestQueue, error) {
+type fifoGate struct {
+	mu      sync.Mutex
+	held    bool
+	waiters []*gateWaiter
+}
+
+func (g *fifoGate) acquire(ctx context.Context) error {
+	g.mu.Lock()
+	if !g.held {
+		g.held = true
+		g.mu.Unlock()
+		return nil
+	}
+	waiter := &gateWaiter{ready: make(chan struct{})}
+	g.waiters = append(g.waiters, waiter)
+	g.mu.Unlock()
+
+	select {
+	case <-waiter.ready:
+		return nil
+	case <-ctx.Done():
+		g.mu.Lock()
+		if !waiter.granted {
+			waiter.canceled = true
+			g.mu.Unlock()
+			return ctx.Err()
+		}
+		g.mu.Unlock()
+		g.release()
+		return ctx.Err()
+	}
+}
+
+func (g *fifoGate) release() {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	for len(g.waiters) > 0 {
+		waiter := g.waiters[0]
+		g.waiters[0] = nil
+		g.waiters = g.waiters[1:]
+		if waiter.canceled {
+			continue
+		}
+		waiter.granted = true
+		close(waiter.ready)
+		return
+	}
+	g.held = false
+}
+
+func (b *bucketState) acquire(ctx context.Context) error {
+	b.active.Add(1)
+	b.lastUsed.Store(time.Now().UnixNano())
+	if err := b.gate.acquire(ctx); err != nil {
+		b.active.Add(-1)
+		return err
+	}
+	return nil
+}
+
+func (b *bucketState) release() {
+	b.lastUsed.Store(time.Now().UnixNano())
+	b.active.Add(-1)
+	b.gate.release()
+}
+
+func (b *bucketState) wait(ctx context.Context) error {
+	delay := time.Until(b.readyAt)
+	if delay <= 0 {
+		return nil
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (b *bucketState) idle(now time.Time) bool {
+	return b.active.Load() == 0 && now.Sub(time.Unix(0, b.lastUsed.Load())) > bucketIdleTimeout
+}
+
+type clientState struct {
+	mu      sync.RWMutex
+	buckets map[uint64]*bucketState
+
+	user       *BotUserResponse
+	identifier string
+	botLimit   uint
+	queueType  QueueType
+	globalHash uint64
+	invalid    atomic.Bool
+}
+
+func newClientState(token string) (*clientState, error) {
 	queueType := NoAuth
 	var user *BotUserResponse
 	var err error
+
 	switch {
 	case HasAuthPrefix(token, "Bearer"):
 		queueType = Bearer
 	case token != "" && !HasAuthPrefix(token, "Basic"):
+		queueType = Bot
 		user, err = GetBotUser(token)
 		if err != nil {
 			return nil, err
@@ -54,154 +154,68 @@ func NewRequestQueue(processor func(ctx context.Context, item *QueueItem) (*http
 	}
 
 	limit, err := GetBotGlobalLimit(token, user)
+	state := &clientState{
+		buckets:    make(map[uint64]*bucketState),
+		user:       user,
+		identifier: "NoAuth",
+		botLimit:   limit,
+		queueType:  queueType,
+	}
 	if err != nil {
 		if strings.HasPrefix(err.Error(), "invalid token") {
-			// Return a queue that will only return 401s
-			var invalid = new(int64)
-			*invalid = 999
-			return &RequestQueue{
-				queues:         make(map[uint64]*QueueChannel),
-				processor:      processor,
-				bufferSize:     bufferSize,
-				user:           nil,
-				identifier:     "InvalidTokenQueue",
-				isTokenInvalid: invalid,
-				botLimit:       limit,
-			}, nil
+			state.identifier = "InvalidTokenQueue"
+			state.invalid.Store(true)
+			return state, nil
 		}
-
 		return nil, err
 	}
 
-	identifier := "NoAuth"
-	if user != nil {
-		queueType = Bot
-		identifier = user.Username + "#" + user.Discrim
+	switch queueType {
+	case Bot:
+		state.identifier = user.Username + "#" + user.Discrim
+		state.globalHash = HashCRC64(user.Id)
+	case Bearer:
+		state.identifier = "Bearer"
+		state.globalHash = HashCRC64(token)
 	}
 
-	if queueType == Bearer {
-		identifier = "Bearer"
-	}
-
-	ret := &RequestQueue{
-		queues:         make(map[uint64]*QueueChannel),
-		processor:      processor,
-		bufferSize:     bufferSize,
-		user:           user,
-		identifier:     identifier,
-		isTokenInvalid: new(int64),
-		botLimit:       limit,
-		queueType:      queueType,
-	}
-
-	if queueType != Bearer {
-		logger.WithFields(logrus.Fields{"globalLimit": limit, "identifier": identifier, "bufferSize": bufferSize}).Info("Created new queue")
-		// Only sweep bot queues, bearer queues get completely destroyed and hold way less endpoints
-		go ret.tickSweep()
-	} else {
-		logger.WithFields(logrus.Fields{"globalLimit": limit, "identifier": identifier, "bufferSize": bufferSize}).Debug("Created new bearer queue")
-	}
-
-	return ret, nil
+	logger.WithFields(map[string]interface{}{
+		"globalLimit": limit,
+		"identifier":  state.identifier,
+	}).Debug("Created client state")
+	return state, nil
 }
 
-func (q *RequestQueue) destroy() {
-	q.Lock()
-	defer q.Unlock()
-	logger.Debug("Destroying queue")
-	for _, val := range q.queues {
-		close(val.ch)
+func (s *clientState) bucket(hash uint64) *bucketState {
+	s.mu.RLock()
+	b := s.buckets[hash]
+	s.mu.RUnlock()
+	if b != nil {
+		return b
 	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if b = s.buckets[hash]; b == nil {
+		b = newBucketState()
+		s.buckets[hash] = b
+	}
+	return b
 }
 
-func (q *RequestQueue) sweep() {
-	q.Lock()
-	defer q.Unlock()
-	logger.Info("Sweep start")
-	sweptEntries := 0
-	for key, val := range q.queues {
-		if time.Since(val.lastUsed) > 10*time.Minute {
-			close(val.ch)
-			delete(q.queues, key)
-			sweptEntries++
+func (s *clientState) sweep(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for hash, bucket := range s.buckets {
+		if bucket.idle(now) {
+			delete(s.buckets, hash)
 		}
 	}
-	logger.WithFields(logrus.Fields{"sweptEntries": sweptEntries}).Info("Finished sweep")
 }
 
-func (q *RequestQueue) tickSweep() {
-	t := time.NewTicker(5 * time.Minute)
-
-	for range t.C {
-		q.sweep()
-	}
-}
-
-func safeSend(queue *QueueChannel, value *QueueItem) {
-	defer func() {
-		if recover() != nil {
-			value.errChan <- errors.New("failed to send due to closed channel, sending 429 for client to retry")
-			Generate429(value.Res)
-		}
-	}()
-
-	queue.ch <- value
-}
-
-func (q *RequestQueue) Queue(req *http.Request, res *http.ResponseWriter, path string, pathHash uint64) error {
-	logger.WithFields(logrus.Fields{
-		"bucket": path,
-		"path":   req.URL.Path,
-		"method": req.Method,
-	}).Trace("Inbound request")
-
-	ch := q.getQueueChannel(path, pathHash)
-
-	doneChan := make(chan *http.Response)
-	errChan := make(chan error)
-
-	safeSend(ch, &QueueItem{req, res, doneChan, errChan})
-
-	select {
-	case <-doneChan:
-		return nil
-	case err := <-errChan:
-		return err
-	}
-}
-
-func (q *RequestQueue) getQueueChannel(path string, pathHash uint64) *QueueChannel {
-	t := time.Now()
-	q.RLock()
-	ch, ok := q.queues[pathHash]
-	if ok {
-		ch.lastUsed = t
-		q.RUnlock()
-		return ch
-	}
-	q.RUnlock()
-
-	q.Lock()
-	defer q.Unlock()
-	ch, ok = q.queues[pathHash]
-	if ok {
-		ch.lastUsed = t
-		return ch
-	}
-
-	ch = &QueueChannel{
-		ch:       make(chan *QueueItem, q.bufferSize),
-		lastUsed: t,
-	}
-	q.queues[pathHash] = ch
-	// It's important that we only have 1 goroutine per channel
-	go q.subscribe(ch, path, pathHash)
-	return ch
-}
-
-func parseHeaders(headers *http.Header, preferRetryAfter bool) (int64, int64, time.Duration, bool, error) {
+func parseHeaders(headers http.Header, preferRetryAfter bool) (int64, int64, time.Duration, bool, error) {
 	if headers == nil {
-		return 0, 0, 0, false, errors.New("null headers")
+		return 0, 0, 0, false, fmt.Errorf("null headers")
 	}
 
 	limit := headers.Get("x-ratelimit-limit")
@@ -209,169 +223,104 @@ func parseHeaders(headers *http.Header, preferRetryAfter bool) (int64, int64, ti
 	resetAfter := headers.Get("x-ratelimit-reset-after")
 	retryAfter := headers.Get("retry-after")
 	if resetAfter == "" || (preferRetryAfter && retryAfter != "") {
-		// Globals return no x-ratelimit-reset-after headers, shared ratelimits have a wrong reset-after
-		// this is the best option without parsing the body
-		resetAfter = headers.Get("retry-after")
+		resetAfter = retryAfter
 	}
 	isGlobal := headers.Get("x-ratelimit-global") == "true"
 
-	var resetParsed float64
-	var reset time.Duration = 0
-	var err error
+	var reset time.Duration
 	if resetAfter != "" {
-		resetParsed, err = strconv.ParseFloat(resetAfter, 64)
-		if err != nil {
-			return 0, 0, 0, false, err
+		seconds, err := strconv.ParseFloat(resetAfter, 64)
+		if err != nil || seconds < 0 || math.IsNaN(seconds) || math.IsInf(seconds, 0) {
+			return 0, 0, 0, false, fmt.Errorf("invalid rate-limit reset %q", resetAfter)
 		}
-
-		// Convert to MS instead of seconds to preserve decimal precision
-		reset = time.Duration(int(resetParsed*1000)) * time.Millisecond
+		reset = time.Duration(seconds * float64(time.Second))
 	}
 
-	if isGlobal {
+	if isGlobal || limit == "" {
 		return 0, 0, reset, isGlobal, nil
-	}
-
-	if limit == "" {
-		return 0, 0, reset, false, nil
 	}
 
 	limitParsed, err := strconv.ParseInt(limit, 10, 32)
 	if err != nil {
-		return 0, 0, 0, false, err
+		return 0, 0, 0, false, fmt.Errorf("invalid rate-limit limit %q: %w", limit, err)
 	}
-
 	remainingParsed, err := strconv.ParseInt(remaining, 10, 32)
 	if err != nil {
-		return 0, 0, 0, false, err
+		return 0, 0, 0, false, fmt.Errorf("invalid rate-limit remaining %q: %w", remaining, err)
 	}
-
-	return limitParsed, remainingParsed, reset, isGlobal, nil
+	return limitParsed, remainingParsed, reset, false, nil
 }
 
-func return404webhook(item *QueueItem) {
-	res := *item.Res
-	res.WriteHeader(404)
-	body := "{\n  \"message\": \"Unknown Webhook\",\n  \"code\": 10015\n}"
-	_, err := res.Write([]byte(body))
-	if err != nil {
-		item.errChan <- err
-		return
-	}
-	item.doneChan <- nil
-
-}
-
-func return401(item *QueueItem) {
-	res := *item.Res
-	res.WriteHeader(401)
-	body := "{\n\t\"message\": \"401: Unauthorized\",\n\t\"code\": 0\n}"
-	_, err := res.Write([]byte(body))
-	if err != nil {
-		item.errChan <- err
-		return
-	}
-	item.doneChan <- nil
-}
-
-func isInteraction(url string) bool {
-	parts := strings.Split(strings.SplitN(url, "?", 1)[0], "/")
-	for _, p := range parts {
-		if len(p) > 128 {
+func isInteraction(path string) bool {
+	path = strings.SplitN(path, "?", 2)[0]
+	for _, part := range strings.Split(path, "/") {
+		if len(part) > 128 {
 			return true
 		}
 	}
 	return false
 }
 
-func (q *RequestQueue) subscribe(ch *QueueChannel, path string, pathHash uint64) {
-	// This function has 1 goroutine for each bucket path
-	// Locking here is not needed
-
-	//Only used for logging
-	var prevRem int64 = 0
-	var prevReset time.Duration = 0
-
-	// Fail fast path for webhook 404s
-	var ret404 = false
-	for item := range ch.ch {
-		ctx := context.WithValue(item.Req.Context(), "identifier", q.identifier)
-		if ret404 {
-			return404webhook(item)
-			continue
-		}
-
-		if atomic.LoadInt64(q.isTokenInvalid) > 0 {
-			return401(item)
-			continue
-		}
-
-		resp, err := q.processor(ctx, item)
-		if err != nil {
-			item.errChan <- err
-			continue
-		}
-
-		scope := resp.Header.Get("x-ratelimit-scope")
-
-		_, remaining, resetAfter, isGlobal, err := parseHeaders(&resp.Header, scope != "user")
-
-		if err != nil {
-			item.errChan <- err
-			continue
-		}
-		item.doneChan <- resp
-
-		if resp.StatusCode == 429 && scope != "shared" {
-			logger.WithFields(logrus.Fields{
-				"prevRemaining":  prevRem,
-				"prevResetAfter": prevReset,
-				"remaining":      remaining,
-				"resetAfter":     resetAfter,
-				"bucket":         path,
-				"route":          item.Req.URL.String(),
-				"method":         item.Req.Method,
-				"isGlobal":       isGlobal,
-				"pathHash":       pathHash,
-				// TODO: Remove this when 429s are not a problem anymore
-				"discordBucket":  resp.Header.Get("x-ratelimit-bucket"),
-				"ratelimitScope": resp.Header.Get("x-ratelimit-scope"),
-			}).Warn("Unexpected 429")
-		}
-
-		if resp.StatusCode == 404 && strings.HasPrefix(path, "/webhooks/") && !isInteraction(item.Req.URL.String()) {
-			logger.WithFields(logrus.Fields{
-				"bucket": path,
-				"route":  item.Req.URL.String(),
-				"method": item.Req.Method,
-			}).Info("Setting fail fast 404 for webhook")
-			ret404 = true
-		}
-
-		if resp.StatusCode == 401 && !isInteraction(item.Req.URL.String()) && q.queueType != NoAuth {
-			// Permanently lock this queue
-			logger.WithFields(logrus.Fields{
-				"bucket":     path,
-				"route":      item.Req.URL.String(),
-				"method":     item.Req.Method,
-				"identifier": q.identifier,
-				"status":     resp.StatusCode,
-			}).Error("Received 401 during normal operation, assuming token is invalidated, locking bucket permanently")
-
-			if !disable401Lock {
-				atomic.StoreInt64(q.isTokenInvalid, 999)
-			}
-		}
-
-		// Prevent reaction bucket from being stuck
-		if resp.StatusCode == 429 && scope == "shared" && (path == "/channels/!/messages/!/reactions/!modify" || path == "/channels/!/messages/!/reactions/!/!") {
-			prevRem, prevReset = remaining, resetAfter
-			continue
-		}
-
-		if remaining == 0 || resp.StatusCode == 429 {
-			time.Sleep(resetAfter)
-		}
-		prevRem, prevReset = remaining, resetAfter
+func syntheticResponse(req *http.Request, status int, headers http.Header, body string) *http.Response {
+	return &http.Response{
+		Status:        strconv.Itoa(status) + " " + http.StatusText(status),
+		StatusCode:    status,
+		Header:        headers,
+		Body:          io.NopCloser(bytes.NewBufferString(body)),
+		ContentLength: int64(len(body)),
+		Request:       req,
 	}
+}
+
+func unauthorizedResponse(req *http.Request) *http.Response {
+	return syntheticResponse(req, http.StatusUnauthorized, http.Header{"Content-Type": {"application/json"}}, "{\n\t\"message\": \"401: Unauthorized\",\n\t\"code\": 0\n}")
+}
+
+func webhookNotFoundResponse(req *http.Request) *http.Response {
+	return syntheticResponse(req, http.StatusNotFound, http.Header{"Content-Type": {"application/json"}}, "{\n  \"message\": \"Unknown Webhook\",\n  \"code\": 10015\n}")
+}
+
+func (s *clientState) updateBucket(bucket *bucketState, path string, resp *http.Response) {
+	if resp.StatusCode == http.StatusNotFound && strings.HasPrefix(path, "/webhooks/") && !isInteraction(resp.Request.URL.String()) {
+		bucket.fail404 = true
+	}
+	if resp.StatusCode == http.StatusUnauthorized && !isInteraction(resp.Request.URL.String()) && s.queueType != NoAuth && !disable401Lock {
+		s.invalid.Store(true)
+	}
+
+	scope := resp.Header.Get("x-ratelimit-scope")
+	_, remaining, resetAfter, isGlobal, err := parseHeaders(resp.Header, scope != "user")
+	if err != nil {
+		logger.WithError(err).WithField("path", path).Warn("Ignoring invalid Discord rate-limit headers")
+		return
+	}
+
+	sharedReaction := resp.StatusCode == http.StatusTooManyRequests && scope == "shared" &&
+		(path == "/channels/!/messages/!/reactions/!modify" || path == "/channels/!/messages/!/reactions/!/!")
+	if !sharedReaction && (remaining == 0 || resp.StatusCode == http.StatusTooManyRequests) {
+		bucket.readyAt = time.Now().Add(resetAfter)
+	}
+
+	if resp.StatusCode == http.StatusTooManyRequests && scope != "shared" {
+		logger.WithFields(map[string]interface{}{
+			"bucket":         path,
+			"route":          resp.Request.URL.String(),
+			"method":         resp.Request.Method,
+			"isGlobal":       isGlobal,
+			"discordBucket":  resp.Header.Get("x-ratelimit-bucket"),
+			"ratelimitScope": scope,
+		}).Warn("Unexpected 429")
+	}
+}
+
+type releasingBody struct {
+	io.ReadCloser
+	once    sync.Once
+	release func()
+}
+
+func (b *releasingBody) Close() error {
+	err := b.ReadCloser.Close()
+	b.once.Do(b.release)
+	return err
 }

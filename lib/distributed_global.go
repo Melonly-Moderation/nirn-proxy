@@ -27,17 +27,33 @@ func NewClusterGlobalRateLimiter() *ClusterGlobalRateLimiter {
 	}
 }
 
-func (c *ClusterGlobalRateLimiter) Take(botHash uint64, botLimit uint) {
+func (c *ClusterGlobalRateLimiter) Take(ctx context.Context, botHash uint64, botLimit uint) error {
 	bucket := c.getOrCreate(botHash, botLimit)
-takeGlobal:
-	_, err := (*bucket).Add(1)
-	if err != nil {
+	for {
+		_, err := (*bucket).Add(1)
+		if err == nil {
+			return nil
+		}
 		reset := (*bucket).Reset()
+		delay := time.Until(reset)
 		logger.WithFields(logrus.Fields{
-			"waitTime": time.Until(reset),
+			"waitTime": delay,
 		}).Trace("Failed to grab global token, sleeping for a bit")
-		time.Sleep(time.Until(reset))
-		goto takeGlobal
+		if delay <= 0 {
+			continue
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		}
 	}
 }
 

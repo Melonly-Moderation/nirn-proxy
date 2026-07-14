@@ -25,7 +25,7 @@ func (h *GlobalHook) Fire(e *logrus.Entry) error {
 	return nil
 }
 
-var logger *logrus.Logger
+var logger = logrus.New()
 
 func SetLogger(l *logrus.Logger) {
 	logger = l

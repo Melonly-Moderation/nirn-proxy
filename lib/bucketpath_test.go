@@ -56,6 +56,10 @@ func TestPaths(t *testing.T) {
 		// Application commands
 		{"/api/v9/applications/203039963636301824/commands", "GET", "/applications/203039963636301824/commands"},
 		{"/api/v9/applications/203039963636301824/commands/203039963636301824", "GET", "/applications/203039963636301824/commands/!"},
+		// Malformed interaction tokens must never panic or leak token contents.
+		{"/api/v10/webhooks/203039963636301824/aW50ZXJhY3Rpb246!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!", "POST", "/webhooks/203039963636301824/Unknown"},
+		// A malformed version prefix is treated as an ordinary unversioned path.
+		{"/api/version/channels", "GET", "/version/channels"},
 	}
 	for _, tt := range tests {
 		testname := fmt.Sprintf("%s-%s", tt.method, tt.path)

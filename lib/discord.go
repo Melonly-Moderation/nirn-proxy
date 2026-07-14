@@ -5,7 +5,7 @@ import (
 	"crypto/tls"
 	"encoding/json"
 	"errors"
-	"github.com/sirupsen/logrus"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -17,7 +17,7 @@ import (
 
 var client *http.Client
 
-var contextTimeout time.Duration
+var contextTimeout = 5 * time.Second
 
 var globalOverrideMap = make(map[string]uint)
 
@@ -101,14 +101,14 @@ func parseGlobalOverrides(overrides string) {
 
 	overrideList := strings.Split(overrides, ",")
 	for _, override := range overrideList {
-		opts := strings.Split(override, ":")
+		opts := strings.SplitN(override, ":", 2)
 		if len(opts) != 2 {
 			panic("Invalid bot global ratelimit overrides")
 		}
 
 		limit, err := strconv.ParseInt(opts[1], 10, 32)
 
-		if err != nil {
+		if err != nil || limit <= 0 || opts[0] == "" {
 			panic("Failed to parse global ratelimit overrides")
 		}
 
@@ -117,6 +117,9 @@ func parseGlobalOverrides(overrides string) {
 }
 
 func ConfigureDiscordHTTPClient(ip string, timeout time.Duration, disableHttp2 bool, globalOverrides string, disableRestDetection bool) {
+	if timeout <= 0 {
+		panic("REQUEST_TIMEOUT must be greater than zero")
+	}
 	transport := createTransport(ip, disableHttp2)
 	client = &http.Client{
 		Transport: transport,
@@ -127,6 +130,7 @@ func ConfigureDiscordHTTPClient(ip string, timeout time.Duration, disableHttp2 b
 
 	disableRestLimitDetection = disableRestDetection
 
+	globalOverrideMap = make(map[string]uint)
 	parseGlobalOverrides(globalOverrides)
 }
 
@@ -171,7 +175,10 @@ func GetBotGlobalLimit(token string, user *BotUserResponse) (uint, error) {
 		return 0, errors.New("500 on gateway/bot")
 	}
 
-	body, _ := io.ReadAll(bot.Body)
+	body, err := io.ReadAll(bot.Body)
+	if err != nil {
+		return 0, err
+	}
 
 	var s BotGatewayResponse
 
@@ -181,6 +188,9 @@ func GetBotGlobalLimit(token string, user *BotUserResponse) (uint, error) {
 	}
 
 	concurrency := s.SessionStartLimit["max_concurrency"]
+	if concurrency <= 0 {
+		return 0, errors.New("gateway/bot response missing max_concurrency")
+	}
 
 	if concurrency == 1 {
 		return 50, nil
@@ -205,13 +215,18 @@ func GetBotUser(token string) (*BotUserResponse, error) {
 	defer bot.Body.Close()
 
 	switch {
+	case bot.StatusCode == 401:
+		// gateway/bot performs the canonical invalid-token check below.
 	case bot.StatusCode == 429:
 		return nil, errors.New("429 on users/@me")
-	case bot.StatusCode == 500:
-		return nil, errors.New("500 on users/@me")
+	case bot.StatusCode >= 400:
+		return nil, fmt.Errorf("users/@me failed with status %s", bot.Status)
 	}
 
-	body, _ := io.ReadAll(bot.Body)
+	body, err := io.ReadAll(bot.Body)
+	if err != nil {
+		return nil, err
+	}
 
 	var s BotUserResponse
 
@@ -257,41 +272,4 @@ func doDiscordReq(ctx context.Context, path string, method string, body io.ReadC
 		RequestHistogram.WithLabelValues(method, status, route, identifier.(string)).Observe(elapsed)
 	}
 	return discordResp, err
-}
-
-func ProcessRequest(ctx context.Context, item *QueueItem) (*http.Response, error) {
-	req := item.Req
-	res := *item.Res
-
-	ctx, cancel := context.WithTimeout(ctx, contextTimeout)
-	defer cancel()
-	bucketPath := GetOptimisticBucketPath(req.URL.Path, req.Method)
-	ctx = context.WithValue(ctx, metricsPathContextKey, MetricsPathFromBucket(bucketPath))
-	discordResp, err := doDiscordReq(ctx, req.URL.Path, req.Method, req.Body, req.Header.Clone(), req.URL.RawQuery)
-
-	if err != nil {
-		if ctx.Err() == context.DeadlineExceeded {
-			res.WriteHeader(408)
-		} else {
-			res.WriteHeader(500)
-		}
-		_, _ = res.Write([]byte(err.Error()))
-		return nil, err
-	}
-
-	logger.WithFields(logrus.Fields{
-		"method": req.Method,
-		"path":   req.URL.String(),
-		"status": discordResp.Status,
-		// TODO: Remove this when 429s are not a problem anymore
-		"discordBucket": discordResp.Header.Get("x-ratelimit-bucket"),
-	}).Debug("Discord request")
-
-	err = CopyResponseToResponseWriter(discordResp, item.Res)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return discordResp, nil
 }
