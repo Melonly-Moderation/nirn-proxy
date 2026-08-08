@@ -1,10 +1,8 @@
-module github.com/germanoeich/nirn-proxy
+module github.com/Melonly-Moderation/nirn-proxy
 
 go 1.26
 
 require (
-	github.com/Clever/leakybucket v1.3.0
-	github.com/hashicorp/golang-lru v1.0.2
 	github.com/hashicorp/memberlist v0.5.4
 	github.com/joho/godotenv v1.5.1
 	github.com/prometheus/client_golang v1.23.2
@@ -22,6 +20,7 @@ require (
 	github.com/hashicorp/go-msgpack/v2 v2.1.5 // indirect
 	github.com/hashicorp/go-multierror v1.1.1 // indirect
 	github.com/hashicorp/go-sockaddr v1.0.7 // indirect
+	github.com/hashicorp/golang-lru v1.0.2 // indirect
 	github.com/miekg/dns v1.1.72 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
