@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -163,6 +164,37 @@ func TestQueueTimeoutAndCapacity(t *testing.T) {
 			t.Fatalf("capacity test leaked through: calls=%d active=%d", calls.Load(), bucket.active.Load())
 		}
 	})
+}
+
+func TestExhaustedInvalidRequestBudgetFailsBeforeSchedulerWait(t *testing.T) {
+	var calls atomic.Int64
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		calls.Add(1)
+		return testResponse(request, http.StatusOK, nil, nil), nil
+	}))
+	config.InvalidRequestLimit = 1
+	config.QueueTimeout = 2 * time.Second
+	proxy := newTestProxy(t, config)
+	now := time.Now()
+	if !proxy.invalidRequests.reserve(now) {
+		t.Fatal("failed to reserve invalid-request test budget")
+	}
+	proxy.invalidRequests.complete(now, true)
+	proxy.noAuth.global.blockFor(time.Hour)
+
+	started := time.Now()
+	_, err := (&scheduledTransport{base: proxy.transport, proxy: proxy}).RoundTrip(
+		scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, "/api/v10/gateway", nil, false),
+	)
+	if !errors.Is(err, errInvalidRequestBudget) {
+		t.Fatalf("request error = %v, want %v", err, errInvalidRequestBudget)
+	}
+	if elapsed := time.Since(started); elapsed >= config.QueueTimeout/2 {
+		t.Fatalf("exhausted budget waited in scheduler for %s", elapsed)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("exhausted budget made %d outbound calls", calls.Load())
+	}
 }
 
 func TestRateLimitResponseIsRetriedWithPOSTBody(t *testing.T) {
@@ -463,40 +495,68 @@ func TestTransportsDefendAgainstInvalidRoundTripperResults(t *testing.T) {
 	})
 }
 
-func TestAbsorbedRateLimitLogDoesNotContainWebhookToken(t *testing.T) {
-	const webhookToken = "thisWebhookTokenMustNeverAppearInLogs_abcdefghijklmnopqrstuvwxyz_0123456789_ABCDEFG"
-	var output bytes.Buffer
+func TestClusterPeerTimeoutLeavesServerResponseMargin(t *testing.T) {
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		return testResponse(request, http.StatusOK, nil, nil), nil
+	}))
+	proxy := newTestProxy(t, config)
+	transport, ok := proxy.peerProxy.Transport.(*timeoutTransport)
+	if !ok {
+		t.Fatalf("peer transport = %T, want *timeoutTransport", proxy.peerProxy.Transport)
+	}
+	if want := config.QueueTimeout + config.UpstreamTimeout; transport.timeout != want {
+		t.Fatalf("peer timeout = %s, want %s", transport.timeout, want)
+	}
+}
+
+type blockingLogWriter struct{ release <-chan struct{} }
+
+func (w blockingLogWriter) Write(message []byte) (int, error) {
+	<-w.release
+	return len(message), nil
+}
+
+func TestRequestCompletionDoesNotDependOnDebugOutput(t *testing.T) {
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
 	testLogger := logrus.New()
-	testLogger.SetOutput(&output)
+	testLogger.SetOutput(blockingLogWriter{release: release})
 	testLogger.SetLevel(logrus.DebugLevel)
-	testLogger.SetFormatter(&logrus.JSONFormatter{DisableTimestamp: true})
 	previousLogger := logger
 	SetLogger(testLogger)
 	t.Cleanup(func() { logger = previousLogger })
 
 	var calls atomic.Int64
-	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
+	proxy := newTestProxy(t, testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		if calls.Add(1) == 1 {
 			return testResponse(request, http.StatusTooManyRequests, testHeaders(map[string]string{
 				"Retry-After":           "0",
-				"X-RateLimit-Scope":     "user",
-				"X-RateLimit-Bucket":    "webhook-bucket",
+				"X-RateLimit-Scope":     "shared",
 				"X-RateLimit-Remaining": "0",
-			}), io.NopCloser(strings.NewReader("retry"))), nil
+			}), nil), nil
 		}
-		return testResponse(request, http.StatusOK, nil, nil), nil
-	})
-	proxy := newTestProxy(t, testConfig(transport))
-	state := newClientState(identify("Bot webhook-log-token"), 1_000_000, 8, newResourceBudget(256))
+		return testResponse(request, http.StatusNoContent, nil, nil), nil
+	})))
 	scheduled := &scheduledTransport{base: proxy.transport, proxy: proxy}
-	path := "/api/v10/webhooks/123456789012345678/" + webhookToken
-	response, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), state, http.MethodPost, path, nil, false))
-	if err != nil {
-		t.Fatal(err)
-	}
-	_ = response.Body.Close()
-	if got := output.String(); strings.Contains(got, webhookToken) {
-		t.Fatalf("absorbed-429 log exposed webhook token: %s", got)
+	result := make(chan error, 1)
+	go func() {
+		response, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodPost, "/api/v10/webhooks/123/token", nil, false))
+		if response != nil {
+			_ = response.Body.Close()
+		}
+		result <- err
+	}()
+
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(time.Second):
+		unblock()
+		t.Fatal("request blocked on debug output")
 	}
 }
 

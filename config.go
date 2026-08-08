@@ -106,7 +106,7 @@ func loadConfig() (appConfig, error) {
 	if err != nil {
 		return appConfig{}, err
 	}
-	disableHTTP2, err := envBool("DISABLE_HTTP_2", false)
+	disableHTTP2, err := envBool("DISABLE_HTTP_2", true)
 	if err != nil {
 		return appConfig{}, err
 	}

@@ -15,8 +15,6 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 const (
@@ -98,6 +96,11 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	metadata, ok := request.Context().Value(requestMetadataContextKey).(*requestMetadata)
 	if !ok {
 		return nil, fmt.Errorf("missing request scheduler metadata")
+	}
+	// Check before joining any rate-limit queue; reserve again immediately before
+	// the outbound attempt to close races with concurrent invalid responses.
+	if !t.proxy.invalidRequests.available(time.Now()) {
+		return nil, errInvalidRequestBudget
 	}
 
 	queueContext, cancelQueue := context.WithTimeout(request.Context(), t.proxy.config.QueueTimeout)
@@ -224,15 +227,6 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			}
 			RequestHistogram.WithLabelValues(metadata.metricsMethod, status, metadata.metricsPath, metadata.state.identity.label).Observe(time.Since(started).Seconds())
 		}
-		if logger.IsLevelEnabled(logrus.DebugLevel) {
-			logger.WithFields(logrus.Fields{
-				"method":        request.Method,
-				"path":          metadata.metricsPath,
-				"status":        response.Status,
-				"discordBucket": response.Header.Get("X-RateLimit-Bucket"),
-			}).Debug("Discord request")
-		}
-
 		if response.StatusCode != http.StatusTooManyRequests {
 			releaseBucket()
 			response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: func() {
@@ -258,12 +252,6 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			return response, nil
 		}
 
-		logger.WithFields(logrus.Fields{
-			"bucket":        metadata.bucketPath,
-			"route":         metadata.metricsPath,
-			"scope":         response.Header.Get("X-RateLimit-Scope"),
-			"discordBucket": response.Header.Get("X-RateLimit-Bucket"),
-		}).Debug("Discord rate limit absorbed; retrying")
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, retryDrainLimit))
 		cancelAttempt()
 		_ = response.Body.Close()
@@ -575,6 +563,7 @@ func (p *Proxy) initReverseProxies() {
 				}
 			case errors.Is(err, context.DeadlineExceeded):
 				http.Error(writer, err.Error(), http.StatusRequestTimeout)
+				logger.WithError(err).WithField("function", "discordProxy").Warn("Discord request deadline exceeded")
 			case errors.Is(err, errQueueFull), errors.Is(err, errTooManyClients), errors.Is(err, errBucketStateLimit), errors.Is(err, errInvalidRequestBudget), errors.Is(err, errRetryCaptureBudget), errors.Is(err, errRetryPreparation):
 				writeUnavailable(writer, err.Error())
 			default:
@@ -590,7 +579,7 @@ func (p *Proxy) initReverseProxies() {
 			preserveForwardingHeaders(proxyRequest)
 			proxyRequest.Out.Header.Set("X-Nirn-Hop", strconv.Itoa(target.hop))
 		},
-		Transport:  &timeoutTransport{base: clusterPeerRoundTripper{proxy: p}, timeout: p.config.QueueTimeout + p.config.UpstreamTimeout + 5*time.Second},
+		Transport:  &timeoutTransport{base: clusterPeerRoundTripper{proxy: p}, timeout: p.config.QueueTimeout + p.config.UpstreamTimeout},
 		BufferPool: buffers,
 		ModifyResponse: func(_ *http.Response) error {
 			if p.config.EnableMetrics {

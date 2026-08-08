@@ -39,6 +39,13 @@ func newInvalidRequestGuard(limit int, window time.Duration) *invalidRequestGuar
 	return &invalidRequestGuard{limit: limit, window: window}
 }
 
+func (g *invalidRequestGuard) available(now time.Time) bool {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.prune(now)
+	return len(g.timestamps)-g.head+g.reserved < g.limit
+}
+
 func (g *invalidRequestGuard) reserve(now time.Time) bool {
 	g.mu.Lock()
 	defer g.mu.Unlock()

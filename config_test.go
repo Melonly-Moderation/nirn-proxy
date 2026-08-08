@@ -66,6 +66,27 @@ func TestInFlightAndMetricsConfiguration(t *testing.T) {
 	}
 }
 
+func TestHTTP2IsDisabledByDefaultButCanBeEnabled(t *testing.T) {
+	clearClusterEnvironment(t)
+	t.Setenv("DISABLE_HTTP_2", "")
+	config, err := loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !config.proxy.DisableHTTP2 {
+		t.Fatal("outbound HTTP/2 was enabled by default")
+	}
+
+	t.Setenv("DISABLE_HTTP_2", "false")
+	config, err = loadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.proxy.DisableHTTP2 {
+		t.Fatal("DISABLE_HTTP_2=false did not enable outbound HTTP/2")
+	}
+}
+
 func TestDotEnvMissingIsOptionalButMalformedFails(t *testing.T) {
 	t.Run("missing", func(t *testing.T) {
 		t.Chdir(t.TempDir())

@@ -32,7 +32,7 @@ Per-attempt deadline for sending the Discord request body through consuming its 
 
 ### `DISABLE_HTTP_2`
 
-Disables HTTP/2 on outbound connections when `true`. It does not affect the inbound server. Default: `false`.
+Disables HTTP/2 on outbound connections when `true`. It does not affect the inbound server. Default: `true` because a stalled multiplexed connection can delay unrelated Discord requests.
 
 ## Scheduling and retries
 

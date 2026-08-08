@@ -347,3 +347,14 @@ func TestDiscordTransportCapsActiveConnections(t *testing.T) {
 		t.Fatalf("Discord connection cap = %d, want 1024", transport.MaxConnsPerHost)
 	}
 }
+
+func TestDiscordTransportDisablesHTTP2(t *testing.T) {
+	transport, err := newHTTPTransport("", true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(transport.CloseIdleConnections)
+	if transport.ForceAttemptHTTP2 || transport.TLSNextProto == nil {
+		t.Fatal("Discord transport still permits HTTP/2")
+	}
+}
