@@ -487,13 +487,16 @@ func unauthorizedResponse(request *http.Request) *http.Response {
 
 func newHTTPTransport(outboundIP string, disableHTTP2 bool) (*http.Transport, error) {
 	transport := http.DefaultTransport.(*http.Transport).Clone()
+	protocols := new(http.Protocols)
+	protocols.SetHTTP1(true)
+	protocols.SetHTTP2(!disableHTTP2)
+	transport.Protocols = protocols
 	transport.MaxIdleConns = 2048
 	transport.MaxIdleConnsPerHost = 1024
 	transport.MaxConnsPerHost = 1024
 	transport.IdleConnTimeout = 90 * time.Second
 	transport.TLSHandshakeTimeout = 10 * time.Second
 	transport.ExpectContinueTimeout = time.Second
-	transport.ForceAttemptHTTP2 = !disableHTTP2
 
 	if outboundIP != "" {
 		address, err := net.ResolveTCPAddr("tcp", net.JoinHostPort(outboundIP, "0"))
@@ -503,8 +506,10 @@ func newHTTPTransport(outboundIP string, disableHTTP2 bool) (*http.Transport, er
 		dialer := &net.Dialer{LocalAddr: address, Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}
 		transport.DialContext = dialer.DialContext
 	}
-	if disableHTTP2 {
-		transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	if disableHTTP2 && transport.TLSClientConfig != nil {
+		// Clone initializes DefaultTransport first, so remove the inherited h2
+		// ALPN advertisement along with disabling its HTTP/2 implementation.
+		transport.TLSClientConfig.NextProtos = []string{"http/1.1"}
 	}
 	return transport, nil
 }

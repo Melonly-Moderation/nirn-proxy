@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net/http"
@@ -349,12 +350,27 @@ func TestDiscordTransportCapsActiveConnections(t *testing.T) {
 }
 
 func TestDiscordTransportDisablesHTTP2(t *testing.T) {
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(writer http.ResponseWriter, _ *http.Request) {
+		writer.WriteHeader(http.StatusNoContent)
+	}))
+	server.EnableHTTP2 = true
+	server.TLS = &tls.Config{NextProtos: []string{"h2", "http/1.1"}}
+	server.StartTLS()
+	t.Cleanup(server.Close)
+
 	transport, err := newHTTPTransport("", true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(transport.CloseIdleConnections)
-	if transport.ForceAttemptHTTP2 || transport.TLSNextProto == nil {
-		t.Fatal("Discord transport still permits HTTP/2")
+	transport.TLSClientConfig.InsecureSkipVerify = true // test server certificate
+
+	response, err := (&http.Client{Transport: transport}).Get(server.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer response.Body.Close()
+	if response.ProtoMajor != 1 {
+		t.Fatalf("Discord protocol = %s, want HTTP/1.1", response.Proto)
 	}
 }
