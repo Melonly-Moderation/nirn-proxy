@@ -40,6 +40,54 @@ func TestGlobalPacerDefaultSpacingAndCancellation(t *testing.T) {
 	}
 }
 
+func testCooldownExtensionWakesWaiter(t *testing.T, wait func(context.Context, time.Duration) (time.Duration, error), extend func()) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	type result struct {
+		delay time.Duration
+		err   error
+	}
+	done := make(chan result, 1)
+	go func() {
+		delay, err := wait(ctx, 100*time.Millisecond)
+		done <- result{delay: delay, err: err}
+	}()
+	select {
+	case got := <-done:
+		t.Fatalf("wait returned before cooldown extension: delay=%s err=%v", got.delay, got.err)
+	case <-time.After(25 * time.Millisecond):
+	}
+	extend()
+	select {
+	case got := <-done:
+		if got.err != nil || got.delay <= 5*time.Second {
+			t.Fatalf("extended wait = (%s, %v), want delay beyond context remainder", got.delay, got.err)
+		}
+	case <-time.After(250 * time.Millisecond):
+		cancel()
+		<-done
+		t.Fatal("cooldown extension did not wake waiter")
+	}
+}
+
+func TestCooldownExtensionWakesDeadlineAwareWaiters(t *testing.T) {
+	t.Run("bucket", func(t *testing.T) {
+		bucket := newBucketState(1)
+		bucket.blockUntil(time.Now().Add(time.Second))
+		testCooldownExtensionWakesWaiter(t, bucket.wait, func() {
+			bucket.blockUntil(time.Now().Add(10 * time.Second))
+		})
+	})
+	t.Run("global", func(t *testing.T) {
+		pacer := newPacer(discordGlobalLimit, 1)
+		pacer.blockFor(time.Second)
+		testCooldownExtensionWakesWaiter(t, pacer.waitFor, func() {
+			pacer.blockFor(10 * time.Second)
+		})
+	})
+}
+
 func TestInvalidRequestGuardReservesAndExpiresCapacity(t *testing.T) {
 	now := time.Now()
 	guard := newInvalidRequestGuard(2, time.Minute)

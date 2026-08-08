@@ -101,6 +101,7 @@ An importable dashboard is included at [grafana/nirn-proxy-dashboard.json](grafa
 | Metric | Labels |
 |---|---|
 | `nirn_proxy_error` | none |
+| `nirn_proxy_failures_total` | `reason` |
 | `nirn_proxy_requests` | `method`, `status`, `route`, `clientId` |
 | `nirn_proxy_open_connections` | `method`, `route` |
 | `nirn_proxy_requests_routed_sent` | none |

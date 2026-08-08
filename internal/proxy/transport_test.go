@@ -332,6 +332,31 @@ func TestRateLimitWaitThatCannotFitReturns429Immediately(t *testing.T) {
 			t.Fatalf("status=%d retry-after=%q calls=%d, want local 429/positive/0", response.StatusCode, response.Header.Get("Retry-After"), calls.Load())
 		}
 	})
+
+	t.Run("longer global response wins", func(t *testing.T) {
+		var calls atomic.Int64
+		config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return testResponse(request, http.StatusNoContent, nil, nil), nil
+		}))
+		config.QueueTimeout = 100 * time.Millisecond
+		config.UpstreamTimeout = 20 * time.Millisecond
+		proxy := newTestProxy(t, config)
+		path := "/api/v10/gateway"
+		bucket := mustBucket(t, proxy.noAuth, routeHash(http.MethodGet, GetOptimisticBucketPath(path, http.MethodGet), majorParameter(path)))
+		bucket.blockUntil(time.Now().Add(2 * time.Second))
+		proxy.noAuth.global.blockFor(3 * time.Second)
+		response, err := (&scheduledTransport{base: proxy.transport, proxy: proxy}).RoundTrip(
+			scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, path, nil, false),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("X-RateLimit-Global") != "true" || response.Header.Get("Retry-After") != "3" || calls.Load() != 0 {
+			t.Fatalf("status=%d global=%q retry-after=%q calls=%d, want 429/true/3/0", response.StatusCode, response.Header.Get("X-RateLimit-Global"), response.Header.Get("Retry-After"), calls.Load())
+		}
+	})
 }
 
 func TestInteractionGlobalRateLimitReturns429BeforeQueueDeadline(t *testing.T) {

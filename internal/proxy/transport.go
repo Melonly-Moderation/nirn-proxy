@@ -170,11 +170,20 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		return delay, false
 	}
 	for attempt := 0; ; attempt++ {
+		if delay, global := knownRateLimit(bucket); retryWouldExceedDeadline(queueContext, delay, t.proxy.config.UpstreamTimeout) {
+			ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+			return rememberedRateLimitResponse(request, delay, global), nil
+		}
 		if delay, err := bucket.wait(queueContext, t.proxy.config.UpstreamTimeout); err != nil {
 			return nil, contextCauseOrError(queueContext, err)
 		} else if delay > 0 {
+			global := false
+			if currentDelay, currentGlobal := knownRateLimit(bucket); currentDelay > 0 {
+				delay = currentDelay
+				global = currentGlobal
+			}
 			ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
-			return rememberedRateLimitResponse(request, delay, false), nil
+			return rememberedRateLimitResponse(request, delay, global), nil
 		}
 		if !metadata.interaction {
 			if delay, err := metadata.state.global.waitFor(queueContext, t.proxy.config.UpstreamTimeout); err != nil {
