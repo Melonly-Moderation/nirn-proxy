@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
 	"net/http/httputil"
@@ -25,6 +26,8 @@ const (
 var (
 	errRetryCaptureBudget = errors.New("retry capture capacity exhausted")
 	errRetryPreparation   = errors.New("retry body preparation failed")
+	errQueueDeadline      = fmt.Errorf("Discord scheduler deadline exceeded: %w", context.DeadlineExceeded)
+	errUpstreamDeadline   = fmt.Errorf("Discord upstream deadline exceeded: %w", context.DeadlineExceeded)
 )
 
 type proxyBufferPool struct{ pool sync.Pool }
@@ -103,7 +106,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		return nil, errInvalidRequestBudget
 	}
 
-	queueContext, cancelQueue := context.WithTimeout(request.Context(), t.proxy.config.QueueTimeout)
+	queueContext, cancelQueue := context.WithTimeoutCause(request.Context(), t.proxy.config.QueueTimeout, errQueueDeadline)
 	queueCleanupPending := true
 	defer func() {
 		if queueCleanupPending {
@@ -112,7 +115,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	}()
 	bucket, err := metadata.state.acquireBucket(queueContext, metadata.routeHash)
 	if err != nil {
-		return nil, err
+		return nil, contextCauseOrError(queueContext, err)
 	}
 	bucketHeld := true
 	defer func() {
@@ -131,7 +134,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 	validationHeld := false
 	if !metadata.interaction && metadata.state.validity.Load() == clientUnknown {
 		if err := metadata.state.validation.acquire(queueContext); err != nil {
-			return nil, err
+			return nil, contextCauseOrError(queueContext, err)
 		}
 		validationHeld = true
 		if metadata.state.validity.Load() != clientUnknown {
@@ -154,13 +157,31 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		return nil, err
 	}
 	defer replay.close()
+	knownRateLimit := func(current *bucketState) (time.Duration, bool) {
+		now := time.Now()
+		delay := current.retryAfter(now)
+		globalDelay := time.Duration(0)
+		if !metadata.interaction {
+			globalDelay = metadata.state.global.retryAfter(now)
+		}
+		if globalDelay > delay {
+			return globalDelay, true
+		}
+		return delay, false
+	}
 	for attempt := 0; ; attempt++ {
-		if err := bucket.wait(queueContext); err != nil {
-			return nil, err
+		if delay, err := bucket.wait(queueContext, t.proxy.config.UpstreamTimeout); err != nil {
+			return nil, contextCauseOrError(queueContext, err)
+		} else if delay > 0 {
+			ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+			return rememberedRateLimitResponse(request, delay, false), nil
 		}
 		if !metadata.interaction {
-			if err := metadata.state.global.wait(queueContext); err != nil {
-				return nil, err
+			if delay, err := metadata.state.global.waitFor(queueContext, t.proxy.config.UpstreamTimeout); err != nil {
+				return nil, contextCauseOrError(queueContext, err)
+			} else if delay > 0 {
+				ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+				return rememberedRateLimitResponse(request, delay, true), nil
 			}
 		}
 
@@ -168,7 +189,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		if err != nil {
 			return nil, fmt.Errorf("%w: %v", errRetryPreparation, err)
 		}
-		attemptContext, cancelAttempt := context.WithTimeout(queueContext, t.proxy.config.UpstreamTimeout)
+		attemptContext, cancelAttempt := context.WithTimeoutCause(queueContext, t.proxy.config.UpstreamTimeout, errUpstreamDeadline)
 		outbound := request.Clone(attemptContext)
 		outbound.Body = body
 		if !t.proxy.invalidRequests.reserve(time.Now()) {
@@ -185,11 +206,12 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		response, err := t.base.RoundTrip(outbound)
 		if err != nil {
 			t.proxy.invalidRequests.complete(time.Now(), false)
+			resultErr := contextCauseOrError(attemptContext, err)
 			cancelAttempt()
 			if response != nil && response.Body != nil {
 				_ = response.Body.Close()
 			}
-			return nil, err
+			return nil, resultErr
 		}
 		if response == nil {
 			t.proxy.invalidRequests.complete(time.Now(), false)
@@ -201,7 +223,7 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		}
 		t.proxy.invalidRequests.complete(time.Now(), invalidDiscordResponse(response))
 
-		metadata.state.observeResponse(
+		observedBucket := metadata.state.observeResponse(
 			metadata.routeHash,
 			metadata.majorKey,
 			metadata.bucketPath,
@@ -242,6 +264,13 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 			_ = response.Body.Close()
 			return nil, fmt.Errorf("%w: %v", errRetryPreparation, prepareErr)
 		}
+		if retryable {
+			delay, _ := knownRateLimit(observedBucket)
+			if retryWouldExceedDeadline(queueContext, delay, t.proxy.config.UpstreamTimeout) {
+				ProxyFailures.WithLabelValues("rate_limit_deadline").Inc()
+				retryable = false
+			}
+		}
 		if !retryable {
 			releaseBucket()
 			response.Body = &cleanupBody{ReadCloser: response.Body, cleanup: func() {
@@ -259,10 +288,34 @@ func (t *scheduledTransport) RoundTrip(request *http.Request) (*http.Response, e
 		releaseBucket()
 		bucket, err = metadata.state.acquireBucket(queueContext, metadata.routeHash)
 		if err != nil {
-			return nil, err
+			return nil, contextCauseOrError(queueContext, err)
 		}
 		bucketHeld = true
 	}
+}
+
+func contextCauseOrError(ctx context.Context, err error) error {
+	if cause := context.Cause(ctx); cause != nil {
+		return cause
+	}
+	return err
+}
+
+func retryWouldExceedDeadline(ctx context.Context, delay, reserve time.Duration) bool {
+	deadline, ok := ctx.Deadline()
+	return delay > 0 && ok && delay+reserve >= time.Until(deadline)
+}
+
+func rememberedRateLimitResponse(request *http.Request, delay time.Duration, global bool) *http.Response {
+	seconds := max(int64(1), int64((delay+time.Second-1)/time.Second))
+	body := fmt.Sprintf(`{"message":"You are being rate limited.","retry_after":%d,"global":%t}`, seconds, global)
+	response := syntheticResponse(request, http.StatusTooManyRequests, body)
+	response.Header.Set("Retry-After", strconv.FormatInt(seconds, 10))
+	if global {
+		response.Header.Set("X-RateLimit-Global", "true")
+		response.Header.Set("X-RateLimit-Scope", "global")
+	}
+	return response
 }
 
 type captureBody struct {
@@ -550,6 +603,7 @@ func newPeerHTTPTransport(config *tls.Config) (*http.Transport, error) {
 
 func (p *Proxy) initReverseProxies() {
 	buffers := &proxyBufferPool{}
+	errorLog := log.New(io.Discard, "", 0)
 	p.discordProxy = &httputil.ReverseProxy{
 		Rewrite: func(proxyRequest *httputil.ProxyRequest) {
 			proxyRequest.SetURL(p.discordURL)
@@ -557,6 +611,7 @@ func (p *Proxy) initReverseProxies() {
 		},
 		Transport:  &scheduledTransport{base: p.transport, proxy: p},
 		BufferPool: buffers,
+		ErrorLog:   errorLog,
 		ErrorHandler: func(writer http.ResponseWriter, _ *http.Request, err error) {
 			switch {
 			case errors.Is(err, context.Canceled):
@@ -566,14 +621,20 @@ func (p *Proxy) initReverseProxies() {
 				default:
 					return
 				}
+			case errors.Is(err, errQueueDeadline):
+				ProxyFailures.WithLabelValues("queue_timeout").Inc()
+				writeProxyError(writer, err.Error(), http.StatusRequestTimeout)
+			case errors.Is(err, errUpstreamDeadline):
+				ProxyFailures.WithLabelValues("upstream_timeout").Inc()
+				writeProxyError(writer, err.Error(), http.StatusGatewayTimeout)
 			case errors.Is(err, context.DeadlineExceeded):
-				http.Error(writer, err.Error(), http.StatusRequestTimeout)
-				logger.WithError(err).WithField("function", "discordProxy").Warn("Discord request deadline exceeded")
+				ProxyFailures.WithLabelValues("deadline").Inc()
+				writeProxyError(writer, err.Error(), http.StatusRequestTimeout)
 			case errors.Is(err, errQueueFull), errors.Is(err, errTooManyClients), errors.Is(err, errBucketStateLimit), errors.Is(err, errInvalidRequestBudget), errors.Is(err, errRetryCaptureBudget), errors.Is(err, errRetryPreparation):
 				writeUnavailable(writer, err.Error())
 			default:
-				http.Error(writer, "Discord upstream unavailable", http.StatusBadGateway)
-				logger.WithError(err).WithField("function", "discordProxy").Error("Discord request failed")
+				ProxyFailures.WithLabelValues("upstream_error").Inc()
+				writeProxyError(writer, "Discord upstream unavailable", http.StatusBadGateway)
 			}
 		},
 	}
@@ -586,6 +647,7 @@ func (p *Proxy) initReverseProxies() {
 		},
 		Transport:  &timeoutTransport{base: clusterPeerRoundTripper{proxy: p}, timeout: p.config.QueueTimeout + p.config.UpstreamTimeout},
 		BufferPool: buffers,
+		ErrorLog:   errorLog,
 		ModifyResponse: func(_ *http.Response) error {
 			if p.config.EnableMetrics {
 				RequestsRoutedSent.Inc()
@@ -596,7 +658,7 @@ func (p *Proxy) initReverseProxies() {
 			if p.config.EnableMetrics {
 				RequestsRoutedError.Inc()
 			}
-			logger.WithError(err).WithField("function", "peerProxy").Warn("Cluster request failed")
+			ProxyFailures.WithLabelValues("peer_error").Inc()
 			writeUnavailable(writer, "cluster peer unavailable")
 		},
 	}

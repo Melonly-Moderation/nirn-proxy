@@ -108,8 +108,8 @@ func TestQueueTimeoutAndCapacity(t *testing.T) {
 		}
 
 		_, err := scheduled.RoundTrip(scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, path, nil, true))
-		if !errors.Is(err, context.DeadlineExceeded) {
-			t.Fatalf("queued request error = %v, want context.DeadlineExceeded", err)
+		if !errors.Is(err, errQueueDeadline) {
+			t.Fatalf("queued request error = %v, want %v", err, errQueueDeadline)
 		}
 		bucket.release()
 		if calls.Load() != 0 || bucket.active.Load() != 0 {
@@ -166,6 +166,23 @@ func TestQueueTimeoutAndCapacity(t *testing.T) {
 	})
 }
 
+func TestUpstreamTimeoutIsDistinctFromQueueTimeout(t *testing.T) {
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	}))
+	config.QueueTimeout = time.Second
+	config.UpstreamTimeout = 20 * time.Millisecond
+	proxy := newTestProxy(t, config)
+
+	_, err := (&scheduledTransport{base: proxy.transport, proxy: proxy}).RoundTrip(
+		scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, "/api/v10/gateway", nil, false),
+	)
+	if !errors.Is(err, errUpstreamDeadline) || errors.Is(err, errQueueDeadline) {
+		t.Fatalf("upstream error = %v, want only %v", err, errUpstreamDeadline)
+	}
+}
+
 func TestExhaustedInvalidRequestBudgetFailsBeforeSchedulerWait(t *testing.T) {
 	var calls atomic.Int64
 	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
@@ -219,7 +236,9 @@ func TestRateLimitResponseIsRetriedWithPOSTBody(t *testing.T) {
 			"X-Ratelimit-Remaining": {"1"},
 		}, io.NopCloser(strings.NewReader("created"))), nil
 	})
-	proxy := newTestProxy(t, testConfig(transport))
+	config := testConfig(transport)
+	config.QueueTimeout = 2 * config.UpstreamTimeout
+	proxy := newTestProxy(t, config)
 	scheduled := &scheduledTransport{base: proxy.transport, proxy: proxy}
 	request := scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodPost, "/api/v10/channels/123/messages", strings.NewReader(payload), true)
 
@@ -250,7 +269,9 @@ func TestRateLimitResponseIsRetriedWithoutBody(t *testing.T) {
 		}
 		return testResponse(request, http.StatusOK, nil, nil), nil
 	})
-	proxy := newTestProxy(t, testConfig(transport))
+	config := testConfig(transport)
+	config.QueueTimeout = 2 * config.UpstreamTimeout
+	proxy := newTestProxy(t, config)
 	scheduled := &scheduledTransport{base: proxy.transport, proxy: proxy}
 	request := scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodGet, "/api/v10/gateway", nil, true)
 	response, err := scheduled.RoundTrip(request)
@@ -263,7 +284,57 @@ func TestRateLimitResponseIsRetriedWithoutBody(t *testing.T) {
 	}
 }
 
-func TestInteractionGlobalRateLimitStillHonorsQueueDeadline(t *testing.T) {
+func TestRateLimitWaitThatCannotFitReturns429Immediately(t *testing.T) {
+	t.Run("current Discord response", func(t *testing.T) {
+		var calls atomic.Int64
+		config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return testResponse(request, http.StatusTooManyRequests, testHeaders(map[string]string{
+				"Retry-After":           "1",
+				"X-RateLimit-Remaining": "0",
+			}), nil), nil
+		}))
+		config.QueueTimeout = 100 * time.Millisecond
+		config.UpstreamTimeout = 20 * time.Millisecond
+		proxy := newTestProxy(t, config)
+		response, err := (&scheduledTransport{base: proxy.transport, proxy: proxy}).RoundTrip(
+			scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodPost, "/api/v10/webhooks/123/token", nil, true),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusTooManyRequests || calls.Load() != 1 {
+			t.Fatalf("status=%d calls=%d, want 429/1", response.StatusCode, calls.Load())
+		}
+	})
+
+	t.Run("remembered bucket response", func(t *testing.T) {
+		var calls atomic.Int64
+		config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			return testResponse(request, http.StatusNoContent, nil, nil), nil
+		}))
+		config.QueueTimeout = 100 * time.Millisecond
+		config.UpstreamTimeout = 20 * time.Millisecond
+		proxy := newTestProxy(t, config)
+		path := "/api/v10/webhooks/123/token"
+		bucket := mustBucket(t, proxy.noAuth, routeHash(http.MethodPost, GetOptimisticBucketPath(path, http.MethodPost), majorParameter(path)))
+		bucket.blockUntil(time.Now().Add(time.Second))
+		response, err := (&scheduledTransport{base: proxy.transport, proxy: proxy}).RoundTrip(
+			scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodPost, path, nil, true),
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer response.Body.Close()
+		if response.StatusCode != http.StatusTooManyRequests || response.Header.Get("Retry-After") == "" || calls.Load() != 0 {
+			t.Fatalf("status=%d retry-after=%q calls=%d, want local 429/positive/0", response.StatusCode, response.Header.Get("Retry-After"), calls.Load())
+		}
+	})
+}
+
+func TestInteractionGlobalRateLimitReturns429BeforeQueueDeadline(t *testing.T) {
 	var calls atomic.Int64
 	transport := roundTripFunc(func(request *http.Request) (*http.Response, error) {
 		calls.Add(1)
@@ -278,12 +349,13 @@ func TestInteractionGlobalRateLimitStillHonorsQueueDeadline(t *testing.T) {
 	proxy := newTestProxy(t, config)
 	scheduled := &scheduledTransport{base: proxy.transport, proxy: proxy}
 	request := scheduledRequest(t, context.Background(), proxy.noAuth, http.MethodPost, "/api/v10/interactions/123/token/callback", nil, true)
-	_, err := scheduled.RoundTrip(request)
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("interaction retry error = %v, want context deadline", err)
+	response, err := scheduled.RoundTrip(request)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if got := calls.Load(); got != 1 {
-		t.Fatalf("interaction made %d attempts after global 429, want 1", got)
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusTooManyRequests || calls.Load() != 1 {
+		t.Fatalf("status=%d calls=%d, want 429/1", response.StatusCode, calls.Load())
 	}
 }
 
@@ -557,6 +629,38 @@ func TestRequestCompletionDoesNotDependOnDebugOutput(t *testing.T) {
 	case <-time.After(time.Second):
 		unblock()
 		t.Fatal("request blocked on debug output")
+	}
+}
+
+func TestTimeoutResponseDoesNotDependOnLogOutput(t *testing.T) {
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	testLogger := logrus.New()
+	testLogger.SetOutput(blockingLogWriter{release: release})
+	previousLogger := logger
+	SetLogger(testLogger)
+	t.Cleanup(func() { logger = previousLogger })
+
+	config := testConfig(roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		<-request.Context().Done()
+		return nil, request.Context().Err()
+	}))
+	config.UpstreamTimeout = 20 * time.Millisecond
+	proxy := newTestProxy(t, config)
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() {
+		proxy.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/api/v10/gateway", nil))
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("timeout response blocked on log output")
+	}
+	if response.Code != http.StatusGatewayTimeout || response.Header().Get("X-Nirn-Proxy-Error") != "true" {
+		t.Fatalf("status=%d proxy-error=%q, want 504/true", response.Code, response.Header().Get("X-Nirn-Proxy-Error"))
 	}
 }
 

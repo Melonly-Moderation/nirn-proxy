@@ -65,17 +65,22 @@ Nirn transparently retries a Discord 429 only when the request body can be repla
 - Bodies with a replay function are replayable.
 - Other bodies are captured while first sent, up to `MAX_RETRY_BODY_BYTES`, and are replayable only if capture completes without exceeding that limit.
 
-Retries re-enter the same bounded scheduler and must complete within `QUEUE_TIMEOUT`. If the body cannot be replayed, Nirn returns Discord's original 429 instead of risking a partial or changed request. Other Discord statuses are not retried.
+Retries re-enter the same bounded scheduler and must complete within `QUEUE_TIMEOUT`. If the known cooldown cannot leave a full `REQUEST_TIMEOUT` attempt, Nirn immediately returns Discord's current 429 or a cached 429 with `Retry-After`. If the body cannot be replayed, Nirn returns Discord's original 429 instead of risking a partial or changed request. Other Discord statuses are not retried.
 
 ## Proxy responses
 
 | Status | Meaning |
 |---|---|
 | Discord status | Discord's response after any safe 429 retry is passed through. |
-| `408 Request Timeout` | The queue/retry deadline or an outbound Discord deadline expired. |
+| `429 Too Many Requests` | Discord's current response, or a cached Discord cooldown that cannot fit before the scheduler deadline. |
+| `408 Request Timeout` | Nirn's scheduler queue/retry deadline expired. |
+| `504 Gateway Timeout` | An outbound Discord attempt exceeded `REQUEST_TIMEOUT`. |
 | `502 Bad Gateway` | Discord could not be reached or returned an unusable transport response. |
-| `503 Service Unavailable` | Nirn could not safely process the request, such as a full queue, unavailable peer, client-capacity exhaustion, or shutdown. Proxy-generated 503 responses include `X-Nirn-Proxy-Error: true`. |
+| `503 Service Unavailable` | Nirn could not safely process the request, such as a full queue, unavailable peer, client-capacity exhaustion, or shutdown. |
 | `400 Bad Request` | `CONNECT` and protocol upgrades are unsupported. |
+
+Proxy-generated 408, 502, 503, and 504 responses include `X-Nirn-Proxy-Error: true`.
+If a deadline expires after Discord response headers were forwarded, Nirn aborts the response stream because its status can no longer be changed.
 
 Nirn does not disguise an internal failure as a Discord 429.
 
@@ -87,7 +92,7 @@ All settings are optional in stand-alone mode, and a local `.env` file is loaded
 
 ## Metrics and health
 
-With metrics enabled, unauthenticated `/metrics` is served on `BIND_IP:METRICS_PORT`. `nirn_proxy_requests` observes Discord responses—one for each outbound attempt that returns response headers—so a transparent retry adds another observation. It excludes transport failures before headers and is not a count of logical inbound requests. The legacy `clientId` label contains only `Bot`, `Bearer`, or `NoAuth`, never an ID or token. Unknown methods become `OTHER`, numeric route components are normalized, and excessive or oversized route labels collapse to `/unknown`.
+With metrics enabled, unauthenticated `/metrics` is served on `BIND_IP:METRICS_PORT`. `nirn_proxy_requests` observes Discord responses—one for each outbound attempt that returns response headers—so a transparent retry adds another observation. It excludes transport failures before headers and is not a count of logical inbound requests. `nirn_proxy_failures_total{reason}` separates scheduler, upstream, peer, and known-rate-limit deadline failures. The legacy `clientId` label contains only `Bot`, `Bearer`, or `NoAuth`, never an ID or token. Unknown methods become `OTHER`, numeric route components are normalized, and excessive or oversized route labels collapse to `/unknown`.
 
 The legacy `nirn_proxy_open_connections` name is retained for dashboard compatibility, but the gauge counts active handler requests rather than TCP sockets.
 

@@ -336,10 +336,14 @@ func isUpgradeRequest(request *http.Request) bool {
 }
 
 func writeUnavailable(writer http.ResponseWriter, message string) {
-	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.Header().Set("Retry-After", "1")
+	writeProxyError(writer, message, http.StatusServiceUnavailable)
+}
+
+func writeProxyError(writer http.ResponseWriter, message string, status int) {
+	writer.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	writer.Header().Set("X-Nirn-Proxy-Error", "true")
-	writer.WriteHeader(http.StatusServiceUnavailable)
+	writer.WriteHeader(status)
 	_, _ = writer.Write([]byte(message + "\n"))
 }
 

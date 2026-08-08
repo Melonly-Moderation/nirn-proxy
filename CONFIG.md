@@ -40,7 +40,9 @@ Disables HTTP/2 on outbound connections when `true`. It does not affect the inbo
 
 Overall deadline once scheduling begins, including FIFO and global waits, every outbound attempt, retry delays, and final Discord response streaming. It is not renewed per retry. Valid range: 1 through 86,400,000 milliseconds. Default: `60000`.
 
-An expired queue or retry deadline returns `408 Request Timeout`.
+Before Discord response headers arrive, an expired scheduler queue returns `408 Request Timeout`, while a Discord attempt that exceeds `REQUEST_TIMEOUT` returns `504 Gateway Timeout`. Both responses include `X-Nirn-Proxy-Error: true`. If a deadline expires after response headers were forwarded, Nirn aborts the response stream because its status can no longer be changed.
+
+When Discord has already supplied a cooldown that cannot leave a full `REQUEST_TIMEOUT` attempt before this deadline, Nirn returns the current Discord `429` or a cached `429` with `Retry-After` immediately instead of holding the connection until it times out.
 
 ### `MAX_QUEUE_DEPTH`
 
@@ -118,6 +120,8 @@ Set this to `true` only if credentials can become valid again without changing t
 Enables Prometheus metrics and serves them on `/metrics`. When `false`, Nirn disables that listener and skips the request histogram, active-request gauge, and cluster-routing observations. Error-level logs may still increment the process-local error counter. Default: `true`.
 
 `nirn_proxy_requests` measures Discord responses, one for each outbound attempt that returns response headers, including absorbed 429 attempts. It excludes transport failures before headers and is not a count of logical inbound requests. Its legacy `clientId` label is only `Bot`, `Bearer`, or `NoAuth`. Unknown methods use `OTHER`; excessive or oversized route labels collapse to `/unknown`.
+
+`nirn_proxy_failures_total{reason}` counts bounded proxy failure reasons, including `queue_timeout`, `upstream_timeout`, `upstream_error`, `peer_error`, and `rate_limit_deadline`.
 
 ### `METRICS_PORT`
 

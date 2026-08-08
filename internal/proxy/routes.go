@@ -111,6 +111,13 @@ func GetOptimisticBucketPath(path, method string) string {
 		bucket.WriteString(majorChannels)
 		bucket.WriteByte('/')
 		bucket.WriteString(parts[1])
+	case "users":
+		bucket.WriteString("users/")
+		if isSnowflake(parts[1]) {
+			bucket.WriteByte('!')
+		} else {
+			bucket.WriteString(parts[1])
+		}
 	case majorInvites:
 		bucket.WriteString(majorInvites)
 		bucket.WriteString("/!")

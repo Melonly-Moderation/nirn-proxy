@@ -27,6 +27,10 @@ var (
 		Name: "nirn_proxy_error",
 		Help: "The total number of errors when processing requests",
 	})
+	ProxyFailures = promauto.NewCounterVec(prometheus.CounterOpts{
+		Name: "nirn_proxy_failures_total",
+		Help: "Proxy failures by bounded reason",
+	}, []string{"reason"})
 
 	RequestHistogram = prometheus.NewHistogramVec(prometheus.HistogramOpts{
 		Name:    "nirn_proxy_requests",

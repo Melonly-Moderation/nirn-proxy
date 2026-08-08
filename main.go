@@ -142,7 +142,12 @@ func run() error {
 	for _, running := range servers[:last] {
 		start(running)
 	}
-	logger.WithField("address", publicAddress).Info("Proxy started")
+	logger.WithFields(logrus.Fields{
+		"address":        publicAddress,
+		"disableHTTP2":   config.proxy.DisableHTTP2,
+		"queueTimeout":   config.proxy.QueueTimeout,
+		"requestTimeout": config.proxy.UpstreamTimeout,
+	}).Info("Proxy started")
 
 	signalContext, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	defer stopSignals()

@@ -111,14 +111,23 @@ func newPacer(limit uint, maxWaiters int) *pacer {
 }
 
 func (p *pacer) wait(ctx context.Context) error {
-	if err := p.gate.acquire(ctx); err != nil {
+	delay, err := p.waitFor(ctx, 0)
+	if err != nil || delay == 0 {
 		return err
+	}
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func (p *pacer) waitFor(ctx context.Context, reserve time.Duration) (time.Duration, error) {
+	if err := p.gate.acquire(ctx); err != nil {
+		return 0, err
 	}
 	defer p.gate.release()
 
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return 0, err
 		}
 		p.mu.Lock()
 		readyAt := p.next
@@ -129,10 +138,16 @@ func (p *pacer) wait(ctx context.Context) error {
 		if !readyAt.After(now) {
 			p.next = now.Add(p.interval)
 			p.mu.Unlock()
-			return nil
+			return 0, nil
 		}
+		blockedDelay := p.blockedUntil.Sub(now)
 		wake := p.wake
 		p.mu.Unlock()
+		if blockedDelay > 0 {
+			if deadline, ok := ctx.Deadline(); ok && blockedDelay+reserve >= time.Until(deadline) {
+				return blockedDelay, nil
+			}
+		}
 
 		timer := time.NewTimer(time.Until(readyAt))
 		select {
@@ -151,7 +166,7 @@ func (p *pacer) wait(ctx context.Context) error {
 				default:
 				}
 			}
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 }
@@ -171,9 +186,16 @@ func (p *pacer) blockFor(delay time.Duration) {
 }
 
 func (p *pacer) blocked(now time.Time) bool {
+	return p.retryAfter(now) > 0
+}
+
+func (p *pacer) retryAfter(now time.Time) time.Duration {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.blockedUntil.After(now)
+	if !p.blockedUntil.After(now) {
+		return 0
+	}
+	return p.blockedUntil.Sub(now)
 }
 
 type rateLimitInfo struct {

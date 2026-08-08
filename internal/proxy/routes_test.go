@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"net/http"
 	"strconv"
 	"testing"
 	"time"
@@ -36,6 +37,9 @@ func TestGetOptimisticBucketPath(t *testing.T) {
 		{path: "/api/v9/webhooks/203039963636301824/VSOzAqY1OZFF5WJVtbIzFtmjGupk-84Hn0A_ZzToF_CHsPIeCk0Q9Uok_mjxR0dNtApI", method: "POST", want: "/webhooks/203039963636301824/!"},
 		{path: "/api/v10/webhooks/203039963636301824/short-secret", method: "POST", want: "/webhooks/203039963636301824/!"},
 		{path: "/api/v10/interactions/203039963636301824/short-secret/followup", method: "POST", want: "/interactions/203039963636301824/!/followup"},
+		{path: "/api/v10/users/787061750905962567", method: "GET", want: "/users/!"},
+		{path: "/api/v10/users/1145768749882937486", method: "GET", want: "/users/!"},
+		{path: "/api/v10/users/@me", method: "GET", want: "/users/@me"},
 		{path: "/api/v9/invites/dyno", method: "GET", want: "/invites/!"},
 		{path: "/api/v9/interactions/203039963636301824/aW50ZXJhY3Rpb246ODg3NTU5MDA01AY4NTUxNDU0OnZwS3QycDhvREk2aVF3U1BqN2prcXBkRmNqNlp4VEhGRjZvSVlXSGh4WG4yb3l6Z3B6NTBPNVc3OHphV05OULLMOHBMa2RTZmVKd3lzVDA2b2h3OTUxaFJ4QlN0dkxXallPcmhnSHNJb0tSV0M5ZzY1NkN4VGRvemFOSHY4b05c/callback", method: "GET", want: "/interactions/203039963636301824/!/callback"},
 		{path: "/api/v10/webhooks/203039963636301824/aW50ZXJhY3Rpb246MTEwMzA0OTQyMDkzMDU2ODMyMjpOZUllWHdNU2J4RXBFMHVYRjBpU0pHMDdEb3BhM3ZlYklBODlMUmtlUXlRbzlpZzYyTnpLU0dqdWlyVlBvZnBSUlJHbUJHYlJ0N29MbE9KQUJVTFk4bTR4UzFtZEpEeXJyY0hBUERmTEhKVE9wRkNzU1FFWUkwTnlpWFY2WHdrRg/messages/@original", method: "POST", want: "/webhooks/203039963636301824/1103049420930568322/messages/@original"},
@@ -60,6 +64,15 @@ func TestGetOptimisticBucketPath(t *testing.T) {
 				t.Fatalf("GetOptimisticBucketPath() = %q, want %q", got, test.want)
 			}
 		})
+	}
+}
+
+func TestUserIDsShareOptimisticBucket(t *testing.T) {
+	paths := []string{"/api/v10/users/787061750905962567", "/api/v10/users/1145768749882937486"}
+	first := routeHash(http.MethodGet, GetOptimisticBucketPath(paths[0], http.MethodGet), majorParameter(paths[0]))
+	second := routeHash(http.MethodGet, GetOptimisticBucketPath(paths[1], http.MethodGet), majorParameter(paths[1]))
+	if first != second {
+		t.Fatal("distinct user IDs bypassed the shared optimistic scheduler bucket")
 	}
 }
 

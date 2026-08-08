@@ -173,10 +173,11 @@ type bucketState struct {
 
 	mu      sync.Mutex
 	readyAt time.Time
+	wake    chan struct{}
 }
 
 func newBucketState(maxWaiters int) *bucketState {
-	bucket := &bucketState{gate: newFIFOGate(maxWaiters)}
+	bucket := &bucketState{gate: newFIFOGate(maxWaiters), wake: make(chan struct{})}
 	bucket.touch()
 	return bucket
 }
@@ -201,21 +202,33 @@ func (b *bucketState) release() {
 	b.gate.release()
 }
 
-func (b *bucketState) wait(ctx context.Context) error {
+func (b *bucketState) wait(ctx context.Context, reserve time.Duration) (time.Duration, error) {
 	for {
 		if err := ctx.Err(); err != nil {
-			return err
+			return 0, err
 		}
 		b.mu.Lock()
 		readyAt := b.readyAt
+		wake := b.wake
 		b.mu.Unlock()
 		delay := time.Until(readyAt)
 		if delay <= 0 {
-			return nil
+			return 0, nil
+		}
+		if deadline, ok := ctx.Deadline(); ok && delay+reserve >= time.Until(deadline) {
+			return delay, nil
 		}
 		timer := time.NewTimer(delay)
 		select {
 		case <-timer.C:
+			continue
+		case <-wake:
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
 			continue
 		case <-ctx.Done():
 			if !timer.Stop() {
@@ -224,7 +237,7 @@ func (b *bucketState) wait(ctx context.Context) error {
 				default:
 				}
 			}
-			return ctx.Err()
+			return 0, ctx.Err()
 		}
 	}
 }
@@ -233,6 +246,8 @@ func (b *bucketState) blockUntil(readyAt time.Time) {
 	b.mu.Lock()
 	if readyAt.After(b.readyAt) {
 		b.readyAt = readyAt
+		close(b.wake)
+		b.wake = make(chan struct{})
 	}
 	b.mu.Unlock()
 }
@@ -250,9 +265,16 @@ func (b *bucketState) idle(now time.Time) bool {
 }
 
 func (b *bucketState) blocked(now time.Time) bool {
+	return b.retryAfter(now) > 0
+}
+
+func (b *bucketState) retryAfter(now time.Time) time.Duration {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.readyAt.After(now)
+	if !b.readyAt.After(now) {
+		return 0
+	}
+	return b.readyAt.Sub(now)
 }
 
 const (
